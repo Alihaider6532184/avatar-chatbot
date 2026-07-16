@@ -1,8 +1,12 @@
 import http from "node:http";
 import next from "next";
 import { WebSocketServer } from "ws";
-import * as pipeline from "./lib/server/avatarPipeline.ts";
+const pipelineModule = await import("./lib/server/avatarPipeline.ts");
+const pipeline = pipelineModule.default ?? pipelineModule;
 const { createSpeechSession, closeSpeechSession, processTextTurn, transcribeAudio, sendPipelineError } = pipeline;
+if (![createSpeechSession, closeSpeechSession, processTextTurn, transcribeAudio, sendPipelineError].every((item) => typeof item === "function")) {
+  throw new Error(`Avatar pipeline exports unavailable: ${Object.keys(pipeline).join(", ")}`);
+}
 
 const port = Number(process.env.PORT || 3000);
 const app = next({ dev: false, hostname: "0.0.0.0", port });
