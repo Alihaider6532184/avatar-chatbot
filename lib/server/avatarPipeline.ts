@@ -199,7 +199,7 @@ export async function processTextTurn(
   let firstAudioAt: number | null = null;
   let reply = "";
   let speechBuffer = "";
-  const fallbackSpeech = new Set<Promise<boolean>>();
+  let fallbackSpeech = Promise.resolve();
   send(ws, {
     type: "response_start",
     response_id: responseId,
@@ -234,7 +234,9 @@ export async function processTextTurn(
     const google = createGoogle({ apiKey: requiredEnvironment("GEMINI_API_KEY") });
     const result = streamText({
       model: google(process.env.GEMINI_MODEL || "gemini-3.1-flash-lite"),
-      system: systemPrompt + "\n\nGive a complete answer to the user's question. Do not stop mid-sentence. Keep it suitable for spoken delivery.",
+      system: systemPrompt
+        + "\n\nAlways answer in English unless the user explicitly asks for another language. "
+        + "Give a complete answer to the user's question. Do not stop mid-sentence. Keep it suitable for spoken delivery.",
       messages: toModelMessages([...history, { role: "user", content: text }]),
       abortSignal: options.abortSignal,
       temperature: 0.5,
@@ -258,19 +260,25 @@ export async function processTextTurn(
       synthesis.request.inputStream.write(chunk);
       // Start the reliable REST speech fallback as soon as a sentence is
       // complete instead of waiting for the entire model response.
-      const sentence = speechBuffer.match(/^([\s\S]*?[.!?])(?:\s|$)/)?.[1];
-      if (sentence) {
+      let sentence = speechBuffer.match(/^([\s\S]*?[.!?])(?:\s|$)/)?.[1];
+      while (sentence) {
         speechBuffer = speechBuffer.slice(sentence.length).trimStart();
-        fallbackSpeech.add(synthesizeFallback(ws, responseId, sentence).then((ok) => {
-          if (ok) synthesis.markAudio();
-          return ok;
-        }).catch(() => false));
+        const sentenceText = sentence;
+        fallbackSpeech = fallbackSpeech.then(async () => {
+          try {
+            if (await synthesizeFallback(ws, responseId, sentenceText)) synthesis.markAudio();
+          } catch {
+            // Continue with the next sentence and report no audio only if all
+            // synthesis attempts fail.
+          }
+        });
+        sentence = speechBuffer.match(/^([\s\S]*?[.!?])(?:\s|$)/)?.[1];
       }
     }
     synthesis.request.inputStream.close();
     await synthesis.completion;
-    await Promise.all(fallbackSpeech);
-    if (!synthesis.hasAudio() && speechBuffer.trim()) {
+    await fallbackSpeech;
+    if (speechBuffer.trim()) {
       try {
         if (await synthesizeFallback(ws, responseId, speechBuffer.trim())) synthesis.markAudio();
       } catch (error) {
