@@ -26,6 +26,7 @@ export default function HomePage() {
   const avatarRef = useRef<AvatarHandle>(null);
   const clientRef = useRef<ChatWebSocketClient | null>(null);
   const activeResponseIdRef = useRef<string | null>(null);
+  const streamOperationsRef = useRef<Promise<void>>(Promise.resolve());
   const cancelledResponseIdsRef = useRef(new Set<string>());
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
@@ -55,6 +56,7 @@ export default function HomePage() {
       }
       if (message.type === "error") {
         avatarRef.current?.cancelStream();
+        streamOperationsRef.current = Promise.resolve();
         const activeResponseId = activeResponseIdRef.current;
         if (activeResponseId) {
           setMessages((current) => current.filter(
@@ -72,7 +74,9 @@ export default function HomePage() {
           ...current,
           { id: message.response_id, role: "assistant", content: "" },
         ]);
-        void avatarRef.current?.startStream(message.sample_rate);
+        streamOperationsRef.current = Promise.resolve(
+          avatarRef.current?.startStream(message.sample_rate),
+        ).then(() => undefined);
         return;
       }
       if (message.type === "response_delta") {
@@ -84,11 +88,15 @@ export default function HomePage() {
         return;
       }
       if (message.type === "response_audio") {
-        void avatarRef.current?.pushStreamAudio(message.audio, message.text);
+        streamOperationsRef.current = streamOperationsRef.current.then(
+          () => avatarRef.current?.pushStreamAudio(message.audio, message.text),
+        ).then(() => undefined);
         return;
       }
       if (message.type === "response_viseme") {
-        void avatarRef.current?.pushStreamViseme(message.viseme);
+        streamOperationsRef.current = streamOperationsRef.current.then(
+          () => avatarRef.current?.pushStreamViseme(message.viseme),
+        ).then(() => undefined);
         return;
       }
       if (message.type === "response_end") {
@@ -97,7 +105,9 @@ export default function HomePage() {
         )));
         activeResponseIdRef.current = null;
         if (message.has_audio) {
-          void avatarRef.current?.endStream();
+          streamOperationsRef.current = streamOperationsRef.current.then(
+            () => avatarRef.current?.endStream(),
+          ).then(() => undefined);
         } else {
           avatarRef.current?.cancelStream();
           setAvatarState("idle");
@@ -200,6 +210,7 @@ export default function HomePage() {
     }
     clientRef.current?.cancelTurn();
     avatarRef.current?.cancelStream();
+    streamOperationsRef.current = Promise.resolve();
     setAvatarState("listening");
   };
 
