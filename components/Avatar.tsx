@@ -386,17 +386,28 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
       });
       // If Azure did not provide viseme events, keep the mouth animated with
       // deterministic fallback cues aligned to each PCM chunk.
-      if (!queuedVisemesRef.current.length) {
-        const queuedMs = queuedAudioRef.current
-          .slice(0, -1)
-          .reduce((total, chunk) => total + chunk.durationMs, 0);
-        const start = releasedAudioDurationMsRef.current + queuedMs;
-        const duration = Math.max(40, sourceAudio.byteLength / 2 / streamSourceRateRef.current * 1_000 / 3);
-        ["aa", "E", "O"].forEach((viseme, index) => queuedVisemesRef.current.push({
-          offset_ms: start + index * duration,
+      const queuedAudioBeforeThis = queuedAudioRef.current
+        .slice(0, -1)
+        .reduce((total, chunk) => total + chunk.durationMs, 0);
+      const syntheticStart = releasedAudioDurationMsRef.current + queuedAudioBeforeThis;
+      const hasSpeechCuesForChunk = queuedVisemesRef.current.some(
+        (cue) => cue.offset_ms >= syntheticStart && cue.viseme !== "sil",
+      );
+      if (!hasSpeechCuesForChunk) {
+        const chunkDuration = sourceAudio.byteLength / 2 / streamSourceRateRef.current * 1_000;
+        const cueDuration = Math.max(45, chunkDuration / 6);
+        ["aa", "E", "O", "PP", "I", "sil"].forEach((viseme, index) => queuedVisemesRef.current.push({
+          offset_ms: syntheticStart + index * cueDuration,
           viseme_id: -1,
           viseme,
         }));
+        // This look-ahead marker lets flushStreamBuffers release the PCM and
+        // its mouth cues together instead of holding the audio until stream end.
+        queuedVisemesRef.current.push({
+          offset_ms: syntheticStart + chunkDuration + LIP_SYNC_LOOK_AHEAD_MS,
+          viseme_id: -1,
+          viseme: "sil",
+        });
       }
       flushStreamBuffers(head);
     },
