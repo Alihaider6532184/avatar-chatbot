@@ -113,7 +113,72 @@ const FINAL_VISEME_DURATION_MS = 120;
 interface QueuedAudioChunk {
   audio: ArrayBuffer;
   durationMs: number;
+  sampleRate: number;
   text?: string;
+}
+
+function buildAudioAwareWordTiming(text: string, audio: ArrayBuffer, sampleRate: number) {
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return { words, wtimes: [], wdurations: [] };
+
+  const samples = new Int16Array(audio);
+  const frameSamples = Math.max(1, Math.round(sampleRate * 0.02));
+  const levels: number[] = [];
+  for (let start = 0; start < samples.length; start += frameSamples) {
+    let sum = 0;
+    const end = Math.min(samples.length, start + frameSamples);
+    for (let index = start; index < end; index += 1) {
+      const value = samples[index] / 32_768;
+      sum += value * value;
+    }
+    levels.push(Math.sqrt(sum / Math.max(1, end - start)));
+  }
+  const peak = Math.max(...levels, 0);
+  const threshold = Math.max(0.006, peak * 0.1);
+  const voiced = levels.map((level) => level >= threshold);
+  // Preserve consonant edges while ensuring actual quiet gaps remain closed.
+  const originalVoiced = [...voiced];
+  originalVoiced.forEach((active, index) => {
+    if (!active) return;
+    if (index > 0) voiced[index - 1] = true;
+    if (index + 1 < voiced.length) voiced[index + 1] = true;
+  });
+
+  const intervals: Array<{ start: number; end: number }> = [];
+  for (let index = 0; index < voiced.length;) {
+    if (!voiced[index]) { index += 1; continue; }
+    const first = index;
+    while (index < voiced.length && voiced[index]) index += 1;
+    intervals.push({ start: first * 20, end: Math.min(index * 20, samples.length / sampleRate * 1_000) });
+  }
+  const durationMs = samples.length / sampleRate * 1_000;
+  if (!intervals.length) intervals.push({ start: 0, end: durationMs });
+  const voicedDuration = intervals.reduce((total, interval) => total + interval.end - interval.start, 0);
+  const weights = words.map((word) => Math.max(1, word.replace(/[^a-z0-9]/gi, "").length));
+  const totalWeight = weights.reduce((total, weight) => total + weight, 0);
+
+  const mapVoicedOffset = (offset: number) => {
+    let remaining = Math.min(offset, voicedDuration);
+    for (const interval of intervals) {
+      const length = interval.end - interval.start;
+      if (remaining <= length) return { time: interval.start + remaining, intervalEnd: interval.end };
+      remaining -= length;
+    }
+    const last = intervals.at(-1) as { start: number; end: number };
+    return { time: last.end, intervalEnd: last.end };
+  };
+
+  let consumedWeight = 0;
+  const wtimes: number[] = [];
+  const wdurations: number[] = [];
+  for (let index = 0; index < words.length; index += 1) {
+    const start = mapVoicedOffset(voicedDuration * consumedWeight / totalWeight);
+    consumedWeight += weights[index];
+    const end = mapVoicedOffset(voicedDuration * consumedWeight / totalWeight);
+    wtimes.push(start.time);
+    wdurations.push(Math.max(40, Math.min(end.time - start.time, start.intervalEnd - start.time)));
+  }
+  return { words, wtimes, wdurations };
 }
 
 interface LipSyncPayload {
@@ -271,13 +336,12 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
 
       if (nextAudio.text) {
         queuedAudioRef.current.shift();
-        const words = nextAudio.text.trim().split(/\s+/).filter(Boolean);
-        const wordDuration = words.length ? nextAudio.durationMs / words.length : nextAudio.durationMs;
+        const timing = buildAudioAwareWordTiming(nextAudio.text, nextAudio.audio, nextAudio.sampleRate);
         activeHead.streamAudio({
           audio: nextAudio.audio,
-          words,
-          wtimes: words.map((_, index) => releasedAudioDurationMsRef.current + index * wordDuration),
-          wdurations: words.map(() => wordDuration),
+          words: timing.words,
+          wtimes: timing.wtimes.map((time) => releasedAudioDurationMsRef.current + time),
+          wdurations: timing.wdurations,
         });
         releasedAudioDurationMsRef.current += nextAudio.durationMs;
         continue;
@@ -409,6 +473,7 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
           head.audioCtx.sampleRate,
         ),
         durationMs: sourceAudio.byteLength / 2 / streamSourceRateRef.current * 1_000,
+        sampleRate: head.audioCtx.sampleRate,
         text,
       });
       if (text) {
