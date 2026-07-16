@@ -34,6 +34,7 @@ interface TalkingHeadLike {
     options: {
       sampleRate: number;
       lipsyncType: "visemes" | "words";
+      lipsyncLang?: string;
       waitForAudioChunks: boolean;
       mood: string;
     },
@@ -355,6 +356,7 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
               // network response loses Chrome's click-based autoplay grant.
               sampleRate: head.audioCtx.sampleRate,
               lipsyncType: "words",
+              lipsyncLang: "en",
               waitForAudioChunks: true,
               mood: "neutral",
             },
