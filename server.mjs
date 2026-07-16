@@ -1,7 +1,8 @@
 import http from "node:http";
 import next from "next";
 import { WebSocketServer } from "ws";
-import { createSpeechSession, closeSpeechSession, processTextTurn, transcribeAudio, sendPipelineError } from "./lib/server/avatarPipeline.ts";
+import * as pipeline from "./lib/server/avatarPipeline.ts";
+const { createSpeechSession, closeSpeechSession, processTextTurn, transcribeAudio, sendPipelineError } = pipeline;
 
 const port = Number(process.env.PORT || 3000);
 const app = next({ dev: false, hostname: "0.0.0.0", port });
