@@ -65,6 +65,7 @@ export class ChatWebSocketClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private manuallyClosed = false;
   private attempts = 0;
+  private pendingActions: Array<(socket: WebSocket) => void> = [];
 
   public constructor(
     private readonly url: string,
@@ -79,6 +80,8 @@ export class ChatWebSocketClient {
     this.socket.onopen = () => {
       this.attempts = 0;
       this.options.onStateChange("connected");
+      const actions = this.pendingActions.splice(0);
+      for (const action of actions) action(this.socket as WebSocket);
     };
     this.socket.onmessage = (event: MessageEvent<string>) => {
       try {
@@ -99,15 +102,28 @@ export class ChatWebSocketClient {
   }
 
   public sendText(text: string): boolean {
-    if (!this.isOpen()) return false;
-    this.socket?.send(JSON.stringify({ type: "text", text }));
+    const action = (socket: WebSocket) => socket.send(JSON.stringify({ type: "text", text }));
+    if (!this.isOpen()) {
+      this.pendingActions.push(action);
+      this.connect();
+      return true;
+    }
+    action(this.socket as WebSocket);
     return true;
   }
 
   public sendAudio(audio: Blob): boolean {
-    if (!this.isOpen() || audio.size === 0) return false;
-    this.socket?.send(JSON.stringify({ type: "audio_metadata", mime_type: audio.type || "audio/webm" }));
-    this.socket?.send(audio);
+    if (audio.size === 0) return false;
+    const action = (socket: WebSocket) => {
+      socket.send(JSON.stringify({ type: "audio_metadata", mime_type: audio.type || "audio/webm" }));
+      socket.send(audio);
+    };
+    if (!this.isOpen()) {
+      this.pendingActions.push(action);
+      this.connect();
+      return true;
+    }
+    action(this.socket as WebSocket);
     return true;
   }
 
@@ -117,17 +133,23 @@ export class ChatWebSocketClient {
   }
 
   public setSessionConfig(systemPrompt: string, workspaceId: string): void {
-    if (!this.isOpen()) return;
-    this.socket?.send(JSON.stringify({
+    const action = (socket: WebSocket) => socket.send(JSON.stringify({
       type: "session_config",
       system_prompt: systemPrompt,
       workspace_id: workspaceId,
     }));
+    if (!this.isOpen()) {
+      this.pendingActions.push(action);
+      this.connect();
+      return;
+    }
+    action(this.socket as WebSocket);
   }
 
   public close(): void {
     this.manuallyClosed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.pendingActions = [];
     this.socket?.close();
     this.socket = null;
   }

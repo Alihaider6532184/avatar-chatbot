@@ -12,10 +12,19 @@ const port = Number(process.env.PORT || 3000);
 const app = next({ dev: false, hostname: "0.0.0.0", port });
 const handle = app.getRequestHandler();
 await app.prepare();
-const server = http.createServer((req, res) => handle(req, res));
+const runtimeStats = { version: "voice-health-v1", connections: 0, messages: 0 };
+const server = http.createServer((req, res) => {
+  if (req.url === "/healthz") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(runtimeStats));
+    return;
+  }
+  handle(req, res);
+});
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", (ws) => {
+  runtimeStats.connections += 1;
   const history = [];
   let speech = null;
   let mime = "audio/webm";
@@ -30,6 +39,7 @@ wss.on("connection", (ws) => {
   };
 
   ws.on("message", (data, isBinary) => {
+    runtimeStats.messages += 1;
     if (!isBinary) {
       let msg;
       try { msg = JSON.parse(data.toString()); } catch (error) { sendPipelineError(ws, error); return; }
