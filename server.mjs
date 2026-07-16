@@ -33,11 +33,6 @@ wss.on("connection", (ws) => {
   let workspaceId = "";
   let active = null;
 
-  const requireSpeech = () => {
-    if (!speech) speech = createSpeechSession();
-    return speech;
-  };
-
   ws.on("message", (data, isBinary) => {
     runtimeStats.messages += 1;
     if (!isBinary) {
@@ -50,7 +45,7 @@ wss.on("connection", (ws) => {
       queue = queue.catch(() => undefined).then(async () => {
         active = new AbortController();
         console.log("[avatar] text turn received");
-        await processTextTurn(ws, history, String(msg.text || ""), requireSpeech(), { abortSignal: active.signal, systemPrompt, workspaceId });
+        await processTextTurn(ws, history, String(msg.text || ""), null, { abortSignal: active.signal, systemPrompt, workspaceId });
         active = null;
       }).catch((error) => sendPipelineError(ws, error));
       return;
@@ -60,7 +55,7 @@ wss.on("connection", (ws) => {
       console.log("[avatar] audio turn received", { bytes: data.length, mime });
       const text = await transcribeAudio(Buffer.from(data), mime);
       if (ws.readyState === 1) ws.send(JSON.stringify({ type: "transcription", text }));
-      await processTextTurn(ws, history, text, requireSpeech(), { abortSignal: active.signal, systemPrompt, workspaceId });
+      await processTextTurn(ws, history, text, null, { abortSignal: active.signal, systemPrompt, workspaceId });
       active = null;
     }).catch((error) => sendPipelineError(ws, error));
   });

@@ -84,7 +84,7 @@ export function closeSpeechSession(session: SpeechSession | null): void {
 
 function beginSynthesis(
   ws: WebSocket,
-  session: SpeechSession,
+  session: SpeechSession | null,
   responseId: string,
   abortSignal?: AbortSignal,
 ): {
@@ -97,6 +97,22 @@ function beginSynthesis(
   let audioReceived = false;
   let visemeCount = 0;
   let lastOffsetMs = 0;
+
+  if (!session) {
+    let closed = false;
+    const inputStream = {
+      write: (_text: string) => undefined,
+      close: () => { closed = true; },
+      get isClosed() { return closed; },
+    };
+    return {
+      request: { inputStream } as speechSdk.SpeechSynthesisRequest,
+      completion: Promise.resolve({} as speechSdk.SpeechSynthesisResult),
+      hasAudio: () => audioReceived,
+      markAudio: () => { audioReceived = true; },
+      visemeSummary: () => ({ count: 0, lastOffsetMs: 0 }),
+    };
+  }
 
   session.synthesizer.synthesizing = (_sender, event) => {
     if (abortSignal?.aborted) return;
@@ -162,7 +178,7 @@ export async function processTextTurn(
   ws: WebSocket,
   history: ChatHistory,
   userText: string,
-  session: SpeechSession,
+  session: SpeechSession | null,
   options: TurnOptions = {},
 ): Promise<void> {
   const text = userText.trim();
@@ -199,13 +215,15 @@ export async function processTextTurn(
     }
   }
   const synthesis = beginSynthesis(ws, session, responseId, options.abortSignal);
-  const originalSynthesizing = session.synthesizer.synthesizing;
-  session.synthesizer.synthesizing = (sender, event) => {
-    if (firstAudioAt === null && event.result.audioData.byteLength > 0) {
-      firstAudioAt = performance.now();
-    }
-    originalSynthesizing(sender, event);
-  };
+  if (session) {
+    const originalSynthesizing = session.synthesizer.synthesizing;
+    session.synthesizer.synthesizing = (sender, event) => {
+      if (firstAudioAt === null && event.result.audioData.byteLength > 0) {
+        firstAudioAt = performance.now();
+      }
+      originalSynthesizing(sender, event);
+    };
+  }
 
   try {
     const google = createGoogle({ apiKey: requiredEnvironment("GEMINI_API_KEY") });
