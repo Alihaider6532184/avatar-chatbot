@@ -18,6 +18,10 @@ export const READY_PLAYER_ME_AVATAR_URL = CONFIGURED_AVATAR_URL || FALLBACK_AVAT
 interface TalkingHeadLike {
   armature: Group;
   audioCtx: AudioContext;
+  lipsync: Record<string, {
+    preProcessText: (text: string) => string;
+    wordsToVisemes: (word: string) => { visemes: string[]; times: number[]; durations: number[] };
+  }>;
   showAvatar: (options: { url: string; body: "F" | "M"; avatarMood: string }) => Promise<void>;
   animate: (milliseconds: number) => void;
   speakAudio: (audio: {
@@ -63,7 +67,7 @@ export interface AvatarHandle {
   pushStreamViseme: (viseme: TimedViseme) => Promise<void>;
   endStream: () => Promise<void>;
   cancelStream: () => void;
-  unlockAudio: () => void;
+  unlockAudio: () => Promise<void>;
 }
 
 interface AvatarProps {
@@ -204,6 +208,8 @@ function AvatarScene({ onHeadReady, onError }: { onHeadReady: (head: TalkingHead
           lipsyncModules: [],
           modelPixelRatio: Math.min(window.devicePixelRatio, 2),
         });
+        const { LipsyncEn } = await import("@met4citizen/talkinghead/modules/lipsync-en.mjs");
+        head.lipsync.en = new LipsyncEn();
         const avatarUrls = CONFIGURED_AVATAR_URL
           ? [CONFIGURED_AVATAR_URL, FALLBACK_AVATAR_URL]
           : [FALLBACK_AVATAR_URL];
@@ -294,8 +300,8 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
   }, []);
 
   useImperativeHandle(ref, () => ({
-    unlockAudio: () => {
-      if (head?.audioCtx.state !== "running") void head?.audioCtx.resume();
+    unlockAudio: async () => {
+      if (head?.audioCtx.state !== "running") await head?.audioCtx.resume();
     },
     speak: async (response) => {
       if (!head || !response.audio) return false;

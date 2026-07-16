@@ -303,8 +303,7 @@ export default function HomePage() {
             <MicButton
               disabled={!avatarReady}
               onInteract={() => {
-                avatarRef.current?.unlockAudio();
-                void avatarRef.current?.startStream(24_000);
+                void avatarRef.current?.unlockAudio().then(() => avatarRef.current?.startStream(24_000));
               }}
               onAudioReady={handleAudioReady}
               onError={(message) => addMessage("system", message)}
