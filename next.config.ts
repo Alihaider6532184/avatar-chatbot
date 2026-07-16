@@ -5,7 +5,7 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   // Vercel's WebSocket upgrader dynamically loads ws at runtime. Bundling ws
   // replaces its optional buffer implementation and breaks frame unmasking.
-  serverExternalPackages: ["ws", "microsoft-cognitiveservices-speech-sdk", "pdf-parse"],
+  serverExternalPackages: ["ws", "microsoft-cognitiveservices-speech-sdk", "unpdf"],
   webpack: (config) => {
     config.module.rules.unshift({
       enforce: "pre",

@@ -14,13 +14,10 @@ function extensionOf(name: string): string {
 async function extractText(file: File): Promise<string> {
   const extension = extensionOf(file.name);
   if (extension === ".pdf") {
-    const { PDFParse } = await import("pdf-parse");
-    const parser = new PDFParse({ data: Buffer.from(await file.arrayBuffer()) });
-    try {
-      return (await parser.getText()).text;
-    } finally {
-      await parser.destroy();
-    }
+    const { extractText: extractPdfText, getDocumentProxy } = await import("unpdf");
+    const pdf = await getDocumentProxy(new Uint8Array(await file.arrayBuffer()));
+    const result = await extractPdfText(pdf, { mergePages: true });
+    return result.text;
   }
   return file.text();
 }

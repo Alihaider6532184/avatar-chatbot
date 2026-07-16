@@ -23,7 +23,11 @@ wss.on("connection", (ws) => {
   let systemPrompt = "";
   let workspaceId = "";
   let active = null;
-  try { speech = createSpeechSession(); } catch (error) { sendPipelineError(ws, error); }
+
+  const requireSpeech = () => {
+    if (!speech) speech = createSpeechSession();
+    return speech;
+  };
 
   ws.on("message", (data, isBinary) => {
     if (!isBinary) {
@@ -34,19 +38,19 @@ wss.on("connection", (ws) => {
       if (msg.type === "audio_metadata") { mime = String(msg.mime_type || "audio/webm"); return; }
       if (msg.type !== "text") return;
       queue = queue.catch(() => undefined).then(async () => {
-        if (!speech) throw new Error("Speech synthesis is not configured.");
         active = new AbortController();
-        await processTextTurn(ws, history, String(msg.text || ""), speech, { abortSignal: active.signal, systemPrompt, workspaceId });
+        console.log("[avatar] text turn received");
+        await processTextTurn(ws, history, String(msg.text || ""), requireSpeech(), { abortSignal: active.signal, systemPrompt, workspaceId });
         active = null;
       }).catch((error) => sendPipelineError(ws, error));
       return;
     }
     queue = queue.catch(() => undefined).then(async () => {
-      if (!speech) throw new Error("Speech synthesis is not configured.");
       active = new AbortController();
+      console.log("[avatar] audio turn received", { bytes: data.length, mime });
       const text = await transcribeAudio(Buffer.from(data), mime);
       if (ws.readyState === 1) ws.send(JSON.stringify({ type: "transcription", text }));
-      await processTextTurn(ws, history, text, speech, { abortSignal: active.signal, systemPrompt, workspaceId });
+      await processTextTurn(ws, history, text, requireSpeech(), { abortSignal: active.signal, systemPrompt, workspaceId });
       active = null;
     }).catch((error) => sendPipelineError(ws, error));
   });
