@@ -84,7 +84,7 @@ export default function HomePage() {
         return;
       }
       if (message.type === "response_audio") {
-        void avatarRef.current?.pushStreamAudio(message.audio);
+        void avatarRef.current?.pushStreamAudio(message.audio, message.text);
         return;
       }
       if (message.type === "response_viseme") {

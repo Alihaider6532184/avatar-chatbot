@@ -170,7 +170,12 @@ async function synthesizeFallback(ws: WebSocket, responseId: string, text: strin
   if (!response.ok) return false;
   const audio = Buffer.from(await response.arrayBuffer());
   if (!audio.length) return false;
-  send(ws, { type: "response_audio", response_id: responseId, audio: audio.toString("base64") });
+  send(ws, {
+    type: "response_audio",
+    response_id: responseId,
+    audio: audio.toString("base64"),
+    text,
+  });
   return true;
 }
 

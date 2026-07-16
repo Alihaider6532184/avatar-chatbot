@@ -29,6 +29,7 @@ export interface ResponseAudio {
   type: "response_audio";
   response_id: string;
   audio: string;
+  text?: string;
 }
 
 export interface ResponseViseme {

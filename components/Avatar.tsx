@@ -33,7 +33,7 @@ interface TalkingHeadLike {
   streamStart: (
     options: {
       sampleRate: number;
-      lipsyncType: "visemes";
+      lipsyncType: "visemes" | "words";
       waitForAudioChunks: boolean;
       mood: string;
     },
@@ -45,6 +45,9 @@ interface TalkingHeadLike {
     visemes?: string[];
     vtimes?: number[];
     vdurations?: number[];
+    words?: string[];
+    wtimes?: number[];
+    wdurations?: number[];
   }) => void;
   streamNotifyEnd: () => void;
   streamInterrupt: () => void;
@@ -55,7 +58,7 @@ interface TalkingHeadLike {
 export interface AvatarHandle {
   speak: (response: ChatResponse) => Promise<boolean>;
   startStream: (sampleRate: number) => Promise<boolean>;
-  pushStreamAudio: (audio: string) => Promise<void>;
+  pushStreamAudio: (audio: string, text?: string) => Promise<void>;
   pushStreamViseme: (viseme: TimedViseme) => Promise<void>;
   endStream: () => Promise<void>;
   cancelStream: () => void;
@@ -105,6 +108,7 @@ const FINAL_VISEME_DURATION_MS = 120;
 interface QueuedAudioChunk {
   audio: ArrayBuffer;
   durationMs: number;
+  text?: string;
 }
 
 interface LipSyncPayload {
@@ -258,6 +262,20 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
         + nextAudio.durationMs
         + LIP_SYNC_LOOK_AHEAD_MS;
 
+      if (nextAudio.text) {
+        queuedAudioRef.current.shift();
+        const words = nextAudio.text.trim().split(/\s+/).filter(Boolean);
+        const wordDuration = words.length ? nextAudio.durationMs / words.length : nextAudio.durationMs;
+        activeHead.streamAudio({
+          audio: nextAudio.audio,
+          words,
+          wtimes: words.map((_, index) => releasedAudioDurationMsRef.current + index * wordDuration),
+          wdurations: words.map(() => wordDuration),
+        });
+        releasedAudioDurationMsRef.current += nextAudio.durationMs;
+        continue;
+      }
+
       if (!force && (!latestViseme || latestViseme.offset_ms < requiredVisemeOffset)) break;
 
       queuedAudioRef.current.shift();
@@ -336,7 +354,7 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
               // Keep the context created with the avatar. Replacing it after a
               // network response loses Chrome's click-based autoplay grant.
               sampleRate: head.audioCtx.sampleRate,
-              lipsyncType: "visemes",
+              lipsyncType: "words",
               waitForAudioChunks: true,
               mood: "neutral",
             },
@@ -373,7 +391,7 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
       streamReadyRef.current = ready;
       return ready;
     },
-    pushStreamAudio: async (audio) => {
+    pushStreamAudio: async (audio, text) => {
       if (!head || !(await streamReadyRef.current)) return;
       const sourceAudio = base64ToArrayBuffer(audio);
       queuedAudioRef.current.push({
@@ -383,7 +401,12 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
           head.audioCtx.sampleRate,
         ),
         durationMs: sourceAudio.byteLength / 2 / streamSourceRateRef.current * 1_000,
+        text,
       });
+      if (text) {
+        flushStreamBuffers(head);
+        return;
+      }
       // If Azure did not provide viseme events, keep the mouth animated with
       // deterministic fallback cues aligned to each PCM chunk.
       const queuedAudioBeforeThis = queuedAudioRef.current
