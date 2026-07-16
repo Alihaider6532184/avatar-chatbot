@@ -69,7 +69,9 @@ export function createSpeechSession(): SpeechSession {
 
   const synthesizer = new speechSdk.SpeechSynthesizer(speechConfig, null);
   const connection = speechSdk.Connection.fromSynthesizer(synthesizer);
-  connection.openConnection();
+  // Do not synchronously open the Azure socket here. On hosted runtimes this
+  // can block the WebSocket connection handler before client message listeners
+  // are registered. The SDK opens it lazily on the first speak request.
   return { synthesizer, connection };
 }
 
