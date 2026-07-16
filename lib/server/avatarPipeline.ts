@@ -198,8 +198,6 @@ export async function processTextTurn(
   let firstTextAt: number | null = null;
   let firstAudioAt: number | null = null;
   let reply = "";
-  let speechBuffer = "";
-  let fallbackSpeech = Promise.resolve();
   send(ws, {
     type: "response_start",
     response_id: responseId,
@@ -251,36 +249,18 @@ export async function processTextTurn(
       if (!chunk) continue;
       if (firstTextAt === null) firstTextAt = performance.now();
       reply += chunk;
-      speechBuffer += chunk;
       send(ws, {
         type: "response_delta",
         response_id: responseId,
         text: chunk,
       });
       synthesis.request.inputStream.write(chunk);
-      // Start the reliable REST speech fallback as soon as a sentence is
-      // complete instead of waiting for the entire model response.
-      let sentence = speechBuffer.match(/^([\s\S]*?[.!?])(?:\s|$)/)?.[1];
-      while (sentence) {
-        speechBuffer = speechBuffer.slice(sentence.length).trimStart();
-        const sentenceText = sentence;
-        fallbackSpeech = fallbackSpeech.then(async () => {
-          try {
-            if (await synthesizeFallback(ws, responseId, sentenceText)) synthesis.markAudio();
-          } catch {
-            // Continue with the next sentence and report no audio only if all
-            // synthesis attempts fail.
-          }
-        });
-        sentence = speechBuffer.match(/^([\s\S]*?[.!?])(?:\s|$)/)?.[1];
-      }
     }
     synthesis.request.inputStream.close();
     await synthesis.completion;
-    await fallbackSpeech;
-    if (speechBuffer.trim()) {
+    if (!synthesis.hasAudio() && reply.trim()) {
       try {
-        if (await synthesizeFallback(ws, responseId, speechBuffer.trim())) synthesis.markAudio();
+        if (await synthesizeFallback(ws, responseId, reply.trim())) synthesis.markAudio();
       } catch (error) {
         console.warn("[avatar] fallback speech synthesis unavailable", error);
       }
