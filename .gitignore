@@ -1,6 +1,11 @@
-.vercel
-.env*
-node_modules
-.next
+backend/.env
+backend/.env.*
+!backend/.env.example
+backend/.venv/
+frontend/.env.local
+frontend/.env.development.local
+frontend/node_modules/
+frontend/.next/
+__pycache__/
+*.py[cod]
 *.log
-tsconfig.tsbuildinfo
