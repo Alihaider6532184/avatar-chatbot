@@ -1,9 +1,7 @@
-.vercel
 .env*
-node_modules
-.next
-*.log
-tsconfig.tsbuildinfo
 .local-data/
+.next/
+node_modules/
+*.log
 passwords.txt
 academy latest project.txt

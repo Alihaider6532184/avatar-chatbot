@@ -1,12 +1,40 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { type ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
 import { Avatar, type AvatarHandle } from "@/components/Avatar";
+import { AvatarCustomizer } from "@/components/AvatarCustomizer";
 import { ChatLog, type ChatMessage } from "@/components/ChatLog";
 import { MicButton } from "@/components/MicButton";
-import { ChatWebSocketClient, type ConnectionState, type ServerMessage } from "@/lib/wsClient";
+import {
+  ChatWebSocketClient,
+  type ConnectionState,
+  type ServerMessage,
+  type TimedViseme,
+} from "@/lib/wsClient";
+import {
+  DEFAULT_VOICE_ID,
+  isVoiceId,
+  type VoiceId,
+} from "@/lib/voices";
+import { validateAvatarGlb } from "@/lib/avatarValidation";
 
 type AvatarState = "idle" | "listening" | "thinking" | "speaking";
+
+interface AvatarChoice {
+  custom: boolean;
+  name: string;
+  url: string | null;
+}
+
+interface VoicePreviewResponse {
+  audio?: string;
+  error?: string;
+  text?: string;
+  visemes?: TimedViseme[];
+}
+
+const MAX_AVATAR_BYTES = 50 * 1024 * 1024;
+const VOICE_STORAGE_KEY = "pitb-avatar-voice";
 
 function websocketUrl(): string {
   const configuredUrl = process.env.NEXT_PUBLIC_WS_URL?.trim();
@@ -28,6 +56,8 @@ export default function HomePage() {
   const activeResponseIdRef = useRef<string | null>(null);
   const streamOperationsRef = useRef<Promise<void>>(Promise.resolve());
   const cancelledResponseIdsRef = useRef(new Set<string>());
+  const customAvatarUrlRef = useRef<string | null>(null);
+  const previewRequestRef = useRef<AbortController | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
@@ -39,6 +69,15 @@ export default function HomePage() {
   const [avatarState, setAvatarState] = useState<AvatarState>("idle");
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [avatarReady, setAvatarReady] = useState(false);
+  const [validatingAvatar, setValidatingAvatar] = useState(false);
+  const [avatarChoice, setAvatarChoice] = useState<AvatarChoice>({
+    custom: false,
+    name: "No avatar selected",
+    url: null,
+  });
+  const [avatarStatus, setAvatarStatus] = useState("Upload a compatible GLB avatar to begin.");
+  const [selectedVoice, setSelectedVoice] = useState<VoiceId>(DEFAULT_VOICE_ID);
+  const [previewingVoice, setPreviewingVoice] = useState<VoiceId | null>(null);
 
   const addMessage = (role: ChatMessage["role"], content: string) => {
     setMessages((current) => [...current, { id: crypto.randomUUID(), role, content }]);
@@ -132,6 +171,18 @@ export default function HomePage() {
   }, []);
 
   useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const savedVoice = window.localStorage.getItem(VOICE_STORAGE_KEY);
+      if (isVoiceId(savedVoice)) setSelectedVoice(savedVoice);
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      previewRequestRef.current?.abort();
+      if (customAvatarUrlRef.current) URL.revokeObjectURL(customAvatarUrlRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
     const storageKey = "pitb-avatar-workspace-id";
     const timer = window.setTimeout(() => {
       const existing = window.localStorage.getItem(storageKey);
@@ -144,12 +195,14 @@ export default function HomePage() {
 
   useEffect(() => {
     if (!workspaceId) return;
-    if (connection === "connected") clientRef.current?.setSessionConfig(systemPrompt, workspaceId);
+    if (connection === "connected") {
+      clientRef.current?.setSessionConfig(systemPrompt, workspaceId, selectedVoice);
+    }
     void fetch(`/api/documents?workspace_id=${encodeURIComponent(workspaceId)}`)
       .then(async (response) => response.ok ? response.json() as Promise<{ documents?: string[] }> : null)
       .then((payload) => { if (payload?.documents) setDocuments(payload.documents); })
       .catch(() => undefined);
-  }, [connection, systemPrompt, workspaceId]);
+  }, [connection, selectedVoice, systemPrompt, workspaceId]);
 
   const uploadDocument = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -173,6 +226,112 @@ export default function HomePage() {
     }
   };
 
+  const uploadAvatar = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".glb")) {
+      setAvatarStatus("Please choose a .glb avatar file.");
+      addMessage("system", "That avatar was not loaded. Please choose a .glb file.");
+      return;
+    }
+    if (file.size > MAX_AVATAR_BYTES) {
+      setAvatarStatus("This file is larger than the 50 MB limit.");
+      addMessage("system", "That avatar is too large. Please use a GLB file under 50 MB.");
+      return;
+    }
+
+    setValidatingAvatar(true);
+    setAvatarStatus("Checking avatar compatibility...");
+    const validation = await validateAvatarGlb(file);
+    setValidatingAvatar(false);
+    if (!validation.valid) {
+      const message = validation.error || "This GLB is not compatible with the talking-avatar engine.";
+      setAvatarStatus(message);
+      addMessage("system", message);
+      return;
+    }
+
+    previewRequestRef.current?.abort();
+    avatarRef.current?.cancelStream();
+    const previousUrl = customAvatarUrlRef.current;
+    const url = URL.createObjectURL(file);
+    customAvatarUrlRef.current = url;
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+    setAvatarReady(false);
+    setAvatarState("idle");
+    setPreviewingVoice(null);
+    setAvatarStatus("Loading your 3D avatar…");
+    setAvatarChoice({ custom: true, name: file.name, url });
+  };
+
+  const resetAvatar = () => {
+    previewRequestRef.current?.abort();
+    avatarRef.current?.cancelStream();
+    const previousUrl = customAvatarUrlRef.current;
+    customAvatarUrlRef.current = null;
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+    setAvatarReady(false);
+    setAvatarState("idle");
+    setPreviewingVoice(null);
+    setAvatarStatus("Upload a compatible GLB avatar to begin.");
+    setAvatarChoice({
+      custom: false,
+      name: "No avatar selected",
+      url: null,
+    });
+  };
+
+  const selectVoice = (voiceId: VoiceId) => {
+    setSelectedVoice(voiceId);
+    window.localStorage.setItem(VOICE_STORAGE_KEY, voiceId);
+    if (workspaceId) {
+      clientRef.current?.setSessionConfig(systemPrompt, workspaceId, voiceId);
+    }
+  };
+
+  const previewVoice = async (voiceId: VoiceId) => {
+    previewRequestRef.current?.abort();
+    avatarRef.current?.cancelStream();
+    void avatarRef.current?.unlockAudio();
+    const controller = new AbortController();
+    previewRequestRef.current = controller;
+    setPreviewingVoice(voiceId);
+    try {
+      const response = await fetch("/api/voice-preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voice_id: voiceId }),
+        signal: controller.signal,
+      });
+      const payload = await response.json() as VoicePreviewResponse;
+      if (!response.ok || !payload.audio || !payload.text || !payload.visemes) {
+        throw new Error(payload.error || "The voice preview could not be played.");
+      }
+      setAvatarState("speaking");
+      const started = await avatarRef.current?.speak({
+        type: "response",
+        text: payload.text,
+        audio: payload.audio,
+        visemes: payload.visemes,
+      });
+      if (!started) {
+        setAvatarState("idle");
+        setPreviewingVoice(null);
+      }
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      setAvatarState("idle");
+      setPreviewingVoice(null);
+      addMessage(
+        "system",
+        error instanceof Error ? error.message : "The voice preview could not be played.",
+      );
+    } finally {
+      if (previewRequestRef.current === controller) previewRequestRef.current = null;
+    }
+  };
+
   const sendText = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const text = draft.trim();
@@ -181,7 +340,7 @@ export default function HomePage() {
     // it from this click keeps Chrome's autoplay permission attached to the
     // context that will actually play the streamed PCM.
     void avatarRef.current?.startStream(24_000);
-    clientRef.current?.setSessionConfig(systemPrompt, workspaceId);
+    clientRef.current?.setSessionConfig(systemPrompt, workspaceId, selectedVoice);
     if (!clientRef.current?.sendText(text)) {
       addMessage("system", "Connecting to the avatar server. Please try again in a moment.");
       return;
@@ -192,7 +351,7 @@ export default function HomePage() {
   };
 
   const handleAudioReady = (audio: Blob) => {
-    clientRef.current?.setSessionConfig(systemPrompt, workspaceId);
+    clientRef.current?.setSessionConfig(systemPrompt, workspaceId, selectedVoice);
     if (!clientRef.current?.sendAudio(audio)) {
       addMessage("system", "Connecting to the avatar server. Please try again in a moment.");
       setAvatarState("idle");
@@ -217,32 +376,58 @@ export default function HomePage() {
   const busy = avatarState === "thinking" || avatarState === "speaking";
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-6xl items-center p-4 sm:p-8">
-      <section className="grid w-full gap-6 rounded-[2rem] border border-slate-700/70 bg-slate-900/70 p-4 shadow-2xl backdrop-blur sm:p-6 lg:grid-cols-[1.08fr_.92fr]">
-        <div className="relative">
-          <Avatar
-            onError={(message) => addMessage("system", message)}
-            onReady={(usingFallback) => {
-              setAvatarReady(true);
-              if (usingFallback) {
-                addMessage("system", "Ready Player Me is unreachable on this network, so a compatible fallback avatar is being used.");
-              }
-            }}
-            onSpeechStart={() => setAvatarState("speaking")}
-            onSpeechEnd={() => setAvatarState("idle")}
-            ref={avatarRef}
-          />
-          <div className="absolute left-5 top-5 flex items-center gap-2 rounded-full bg-slate-950/75 px-3 py-1.5 text-xs font-medium backdrop-blur">
-            <span className={`h-2 w-2 rounded-full ${avatarState === "listening" ? "bg-rose-400" : avatarState === "speaking" ? "bg-cyan-300" : "bg-emerald-400"}`} />
-            {stateCopy[avatarState]}
+    <main className="mx-auto flex min-h-screen max-w-7xl items-center p-4 sm:p-8">
+      <section className="grid w-full gap-6 rounded-[2rem] border border-slate-700/70 bg-slate-900/70 p-4 shadow-2xl backdrop-blur sm:p-6 lg:grid-cols-[1.04fr_.96fr]">
+        <div>
+          <div className="relative">
+            <Avatar
+              avatarUrl={avatarChoice.url}
+              onError={(message) => {
+                setAvatarReady(false);
+                setAvatarStatus("Avatar loading failed.");
+                addMessage("system", message);
+              }}
+              onReady={() => {
+                setAvatarReady(true);
+                setAvatarStatus("Your avatar is loaded and ready");
+              }}
+              onSpeechStart={() => setAvatarState("speaking")}
+              onSpeechEnd={() => {
+                setAvatarState("idle");
+                setPreviewingVoice(null);
+              }}
+              ref={avatarRef}
+            />
+            <div className="absolute left-5 top-5 flex items-center gap-2 rounded-full bg-slate-950/75 px-3 py-1.5 text-xs font-medium backdrop-blur">
+              <span className={`h-2 w-2 rounded-full ${avatarState === "listening" ? "bg-rose-400" : avatarState === "speaking" ? "bg-cyan-300" : "bg-emerald-400"}`} />
+              {stateCopy[avatarState]}
+            </div>
           </div>
+          <AvatarCustomizer
+            avatarName={avatarChoice.name}
+            avatarStatus={avatarStatus}
+            avatarDisabled={
+              busy
+              || previewingVoice !== null
+              || validatingAvatar
+              || (avatarChoice.url !== null && !avatarReady)
+            }
+            customAvatar={avatarChoice.custom}
+            onAvatarUpload={uploadAvatar}
+            onPreviewVoice={(voiceId) => { void previewVoice(voiceId); }}
+            onResetAvatar={resetAvatar}
+            onSelectVoice={selectVoice}
+            previewingVoice={previewingVoice}
+            selectedVoice={selectedVoice}
+            voiceDisabled={!avatarReady || busy || previewingVoice !== null || validatingAvatar}
+          />
         </div>
 
-        <div className="flex min-h-0 flex-col rounded-3xl bg-slate-950/50 p-4 sm:p-5">
+        <div className="flex min-h-[680px] min-w-0 flex-col rounded-3xl bg-slate-950/50 p-4 sm:p-5">
           <div className="mb-4 flex items-center justify-between">
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300">PITB Avatar</p>
-              <h1 className="mt-1 text-2xl font-semibold text-white">Your voice assistant</h1>
+              <h1 className="mt-1 text-2xl font-semibold text-white">Your personal AI avatar</h1>
             </div>
             <span className={`rounded-full px-2.5 py-1 text-xs ${connection === "connected" ? "bg-emerald-400/10 text-emerald-300" : "bg-amber-400/10 text-amber-200"}`}>
               {connection}
@@ -308,7 +493,7 @@ export default function HomePage() {
               className="min-w-0 flex-1 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm outline-none placeholder:text-slate-500 focus:border-cyan-400"
               disabled={busy || !avatarReady}
               onChange={(event) => setDraft(event.target.value)}
-              placeholder={avatarReady ? "Type a message…" : "Loading avatar…"}
+              placeholder={avatarReady ? "Type a message…" : "Upload an avatar first…"}
               value={draft}
             />
             <MicButton

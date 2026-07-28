@@ -1,9 +1,13 @@
-import { createGoogle } from "@ai-sdk/google";
-import { streamText, type ModelMessage } from "ai";
+import https from "node:https";
 import * as speechSdk from "microsoft-cognitiveservices-speech-sdk";
 import type { WebSocket } from "ws";
 import { toOculusViseme } from "@/lib/server/visemes";
 import { retrieveContext } from "@/lib/server/rag";
+import {
+  DEFAULT_VOICE_ID,
+  getVoice,
+  type VoiceId,
+} from "@/lib/voices";
 
 const DEFAULT_SYSTEM_PROMPT =
   "You are a helpful conversational avatar assistant. Answer clearly, warmly, "
@@ -13,6 +17,8 @@ const DEFAULT_SYSTEM_PROMPT =
 const MAX_HISTORY_MESSAGES = 12;
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 const MAX_TEXT_CHARACTERS = 4_000;
+const directFetch = globalThis.fetch.bind(globalThis);
+const directHttpsRequest = https.request.bind(https);
 
 export type ChatHistory = Array<{ role: "user" | "assistant"; content: string }>;
 
@@ -20,9 +26,21 @@ export interface TurnOptions {
   systemPrompt?: string;
   abortSignal?: AbortSignal;
   workspaceId?: string;
+  voiceId?: VoiceId;
 }
 
 type ServerEvent = Record<string, unknown> & { type: string };
+
+interface TimedViseme {
+  offset_ms: number;
+  viseme_id: number;
+  viseme: string;
+}
+
+interface TimedSpeech {
+  audio: Buffer;
+  visemes: TimedViseme[];
+}
 
 function send(ws: WebSocket, event: ServerEvent): void {
   if (ws.readyState === 1) ws.send(JSON.stringify(event));
@@ -34,19 +52,12 @@ function requiredEnvironment(name: string): string {
   return value;
 }
 
-function toModelMessages(history: ChatHistory): ModelMessage[] {
-  return history.slice(-MAX_HISTORY_MESSAGES).map((message) => ({
-    role: message.role,
-    content: message.content,
-  }));
-}
-
 export interface SpeechSession {
   synthesizer: speechSdk.SpeechSynthesizer;
   connection: speechSdk.Connection;
 }
 
-export function createSpeechSession(): SpeechSession {
+export function createSpeechSession(voiceId: VoiceId = DEFAULT_VOICE_ID): SpeechSession {
   const region = requiredEnvironment("AZURE_SPEECH_REGION");
   // Use the SDK's subscription configuration so it negotiates the correct
   // regional websocket endpoint and keeps streaming synthesis reliable on
@@ -55,7 +66,7 @@ export function createSpeechSession(): SpeechSession {
     requiredEnvironment("AZURE_SPEECH_KEY"),
     region,
   );
-  speechConfig.speechSynthesisVoiceName = "en-US-JennyNeural";
+  speechConfig.speechSynthesisVoiceName = getVoice(voiceId).azureName;
   speechConfig.speechSynthesisOutputFormat =
     speechSdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm;
   speechConfig.setProperty(
@@ -77,113 +88,243 @@ export function createSpeechSession(): SpeechSession {
 
 export function closeSpeechSession(session: SpeechSession | null): void {
   if (!session) return;
-  session.connection.closeConnection();
-  session.connection.close();
   session.synthesizer.close();
 }
 
-function beginSynthesis(
-  ws: WebSocket,
-  session: SpeechSession | null,
-  responseId: string,
-  abortSignal?: AbortSignal,
-): {
-  request: speechSdk.SpeechSynthesisRequest;
-  completion: Promise<speechSdk.SpeechSynthesisResult>;
-  hasAudio: () => boolean;
-  markAudio: () => void;
-  visemeSummary: () => { count: number; lastOffsetMs: number };
-} {
-  let audioReceived = false;
-  let visemeCount = 0;
-  let lastOffsetMs = 0;
+function escapeSsml(text: string): string {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
 
-  if (!session) {
-    let closed = false;
-    const inputStream = {
-      write: (_text: string) => undefined,
-      close: () => { closed = true; },
-      get isClosed() { return closed; },
-    };
+async function fetchAzureSpeech(
+  text: string,
+  voiceId: VoiceId,
+  outputFormat: "raw-24khz-16bit-mono-pcm" | "riff-24khz-16bit-mono-pcm",
+): Promise<Buffer> {
+  const region = requiredEnvironment("AZURE_SPEECH_REGION");
+  const body = `<speak version="1.0" xml:lang="en-US"><voice name="${getVoice(voiceId).azureName}">${escapeSsml(text)}</voice></speak>`;
+  return new Promise<Buffer>((resolve, reject) => {
+    const request = directHttpsRequest(
+      {
+        hostname: `${region}.tts.speech.microsoft.com`,
+        path: "/cognitiveservices/v1",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/ssml+xml",
+          "Content-Length": Buffer.byteLength(body),
+        "Ocp-Apim-Subscription-Key": requiredEnvironment("AZURE_SPEECH_KEY"),
+        "User-Agent": "piba-avatar-local",
+        "X-Microsoft-OutputFormat": outputFormat,
+      },
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => {
+          if ((response.statusCode ?? 500) >= 400) {
+            reject(new Error(`Speech synthesis failed with status ${response.statusCode}.`));
+            return;
+          }
+          resolve(Buffer.concat(chunks));
+        });
+      },
+    );
+    request.setTimeout(30_000, () => {
+      request.destroy(new Error("Speech synthesis took too long to respond."));
+    });
+    request.on("error", reject);
+    request.end(body);
+  });
+}
+
+async function synthesizeAzureTimedSpeech(
+  text: string,
+  voiceId: VoiceId,
+  outputFormat: speechSdk.SpeechSynthesisOutputFormat,
+): Promise<TimedSpeech> {
+  const speechConfig = speechSdk.SpeechConfig.fromSubscription(
+    requiredEnvironment("AZURE_SPEECH_KEY"),
+    requiredEnvironment("AZURE_SPEECH_REGION"),
+  );
+  speechConfig.speechSynthesisVoiceName = getVoice(voiceId).azureName;
+  speechConfig.speechSynthesisOutputFormat = outputFormat;
+  speechConfig.setProperty(
+    speechSdk.PropertyId.SpeechSynthesis_FrameTimeoutInterval,
+    "30000000",
+  );
+  speechConfig.setProperty(
+    speechSdk.PropertyId.SpeechSynthesis_RtfTimeoutThreshold,
+    "10",
+  );
+
+  const synthesizer = new speechSdk.SpeechSynthesizer(speechConfig, null);
+  const visemes: TimedViseme[] = [];
+  synthesizer.visemeReceived = (_sender, event) => {
+    visemes.push({
+      offset_ms: event.audioOffset / 10_000,
+      viseme_id: event.visemeId,
+      viseme: toOculusViseme(event.visemeId),
+    });
+  };
+
+  try {
+    const result = await new Promise<speechSdk.SpeechSynthesisResult>((resolve, reject) => {
+      let settled = false;
+      const finish = (
+        callback: (value: speechSdk.SpeechSynthesisResult) => void,
+        value: speechSdk.SpeechSynthesisResult,
+      ) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        callback(value);
+      };
+      const fail = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      };
+      const timeout = setTimeout(() => {
+        fail(new Error("Timed speech synthesis took too long to respond."));
+      }, 30_000);
+      synthesizer.speakTextAsync(
+        text,
+        (value) => finish(resolve, value),
+        fail,
+      );
+    });
+    if (
+      result.reason !== speechSdk.ResultReason.SynthesizingAudioCompleted
+      || !result.audioData.byteLength
+    ) {
+      throw new Error("Timed speech synthesis returned no audio.");
+    }
     return {
-      request: { inputStream } as speechSdk.SpeechSynthesisRequest,
-      completion: Promise.resolve({} as speechSdk.SpeechSynthesisResult),
-      hasAudio: () => audioReceived,
-      markAudio: () => { audioReceived = true; },
-      visemeSummary: () => ({ count: 0, lastOffsetMs: 0 }),
+      audio: Buffer.from(result.audioData),
+      visemes: visemes.sort((left, right) => left.offset_ms - right.offset_ms),
     };
+  } finally {
+    synthesizer.close();
   }
+}
 
-  session.synthesizer.synthesizing = (_sender, event) => {
-    if (abortSignal?.aborted) return;
-    const audio = Buffer.from(event.result.audioData);
-    if (!audio.length) return;
-    audioReceived = true;
+async function generateGeminiReply(
+  systemPrompt: string,
+  history: ChatHistory,
+  abortSignal?: AbortSignal,
+): Promise<string> {
+  const model = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite";
+  const body = JSON.stringify({
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    contents: history.slice(-MAX_HISTORY_MESSAGES).map((message) => ({
+      role: message.role === "assistant" ? "model" : "user",
+      parts: [{ text: message.content }],
+    })),
+    generationConfig: {
+      temperature: 0.5,
+      maxOutputTokens: 700,
+      thinkingConfig: { thinkingLevel: "minimal" },
+    },
+  });
+
+  const payload = await new Promise<string>((resolve, reject) => {
+    const request = directHttpsRequest(
+      {
+        hostname: "generativelanguage.googleapis.com",
+        path: `/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+          "x-goog-api-key": requiredEnvironment("GEMINI_API_KEY"),
+        },
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => {
+          const responseBody = Buffer.concat(chunks).toString("utf8");
+          if ((response.statusCode ?? 500) >= 400) {
+            reject(new Error(`The AI service returned status ${response.statusCode}.`));
+            return;
+          }
+          resolve(responseBody);
+        });
+      },
+    );
+    const abort = () => request.destroy(new Error("The AI request was cancelled."));
+    abortSignal?.addEventListener("abort", abort, { once: true });
+    request.setTimeout(30_000, () => {
+      request.destroy(new Error("The AI service took too long to respond."));
+    });
+    request.on("error", reject);
+    request.on("close", () => abortSignal?.removeEventListener("abort", abort));
+    request.end(body);
+  });
+
+  const result = JSON.parse(payload) as {
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+  };
+  return result.candidates?.[0]?.content?.parts
+    ?.map((part) => part.text ?? "")
+    .join("")
+    .trim() ?? "";
+}
+
+async function synthesizeFallback(
+  ws: WebSocket,
+  responseId: string,
+  text: string,
+  voiceId: VoiceId,
+): Promise<{ hasAudio: boolean; visemeCount: number; lastVisemeOffsetMs: number }> {
+  try {
+    const timedSpeech = await synthesizeAzureTimedSpeech(
+      text,
+      voiceId,
+      speechSdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm,
+    );
     send(ws, {
       type: "response_audio",
       response_id: responseId,
-      audio: audio.toString("base64"),
+      audio: timedSpeech.audio.toString("base64"),
     });
-  };
-  session.synthesizer.visemeReceived = (_sender, event) => {
-    if (abortSignal?.aborted) return;
-    const offsetMs = event.audioOffset / 10_000;
-    visemeCount += 1;
-    lastOffsetMs = offsetMs;
-    send(ws, {
+    timedSpeech.visemes.forEach((viseme) => send(ws, {
       type: "response_viseme",
       response_id: responseId,
-      viseme: {
-        offset_ms: offsetMs,
-        viseme_id: event.visemeId,
-        viseme: toOculusViseme(event.visemeId),
-      },
-    });
-  };
+      viseme,
+    }));
+    return {
+      hasAudio: true,
+      visemeCount: timedSpeech.visemes.length,
+      lastVisemeOffsetMs: timedSpeech.visemes.at(-1)?.offset_ms ?? 0,
+    };
+  } catch (error) {
+    console.warn("[avatar] timed Azure visemes unavailable; using audio-aware fallback", error);
+  }
 
-  const request = new speechSdk.SpeechSynthesisRequest(
-    speechSdk.SpeechSynthesisRequestInputType.TextStream,
-  );
-  const completion = new Promise<speechSdk.SpeechSynthesisResult>((resolve, reject) => {
-    session.synthesizer.speakAsync(request, resolve, reject);
-  });
-  return {
-    request,
-    completion,
-    hasAudio: () => audioReceived,
-    markAudio: () => { audioReceived = true; },
-    visemeSummary: () => ({ count: visemeCount, lastOffsetMs }),
-  };
-}
-
-async function synthesizeFallback(ws: WebSocket, responseId: string, text: string): Promise<boolean> {
-  const region = requiredEnvironment("AZURE_SPEECH_REGION");
-  const response = await fetch(`https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`, {
-    method: "POST",
-    headers: {
-      "Ocp-Apim-Subscription-Key": requiredEnvironment("AZURE_SPEECH_KEY"),
-      "Content-Type": "application/ssml+xml",
-      "X-Microsoft-OutputFormat": "raw-24khz-16bit-mono-pcm",
-    },
-    body: `<speak version="1.0" xml:lang="en-US"><voice name="en-US-JennyNeural">${text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</voice></speak>`,
-  });
-  if (!response.ok) return false;
-  const audio = Buffer.from(await response.arrayBuffer());
-  if (!audio.length) return false;
+  const audio = await fetchAzureSpeech(text, voiceId, "raw-24khz-16bit-mono-pcm");
+  if (!audio.length) {
+    return { hasAudio: false, visemeCount: 0, lastVisemeOffsetMs: 0 };
+  }
   send(ws, {
     type: "response_audio",
     response_id: responseId,
     audio: audio.toString("base64"),
     text,
   });
-  return true;
+  return { hasAudio: true, visemeCount: 0, lastVisemeOffsetMs: 0 };
 }
 
 export async function processTextTurn(
   ws: WebSocket,
   history: ChatHistory,
   userText: string,
-  session: SpeechSession | null,
+  _session: SpeechSession | null,
   options: TurnOptions = {},
 ): Promise<void> {
   const text = userText.trim();
@@ -192,17 +333,20 @@ export async function processTextTurn(
   if (text.length > MAX_TEXT_CHARACTERS) {
     throw new Error("Please keep messages under 4,000 characters.");
   }
-
   const responseId = crypto.randomUUID();
   const startedAt = performance.now();
   let firstTextAt: number | null = null;
   let firstAudioAt: number | null = null;
+  let fallbackVisemeCount = 0;
+  let fallbackLastVisemeOffsetMs = 0;
+  let hasAudio = false;
   let reply = "";
   send(ws, {
     type: "response_start",
     response_id: responseId,
     sample_rate: 24_000,
   });
+  console.info("[avatar] response started");
 
   let systemPrompt = options.systemPrompt?.trim() || DEFAULT_SYSTEM_PROMPT;
   if (options.workspaceId) {
@@ -217,62 +361,52 @@ export async function processTextTurn(
       console.warn("[avatar] RAG retrieval unavailable", error);
     }
   }
-  const synthesis = beginSynthesis(ws, session, responseId, options.abortSignal);
-  if (session) {
-    const originalSynthesizing = session.synthesizer.synthesizing;
-    session.synthesizer.synthesizing = (sender, event) => {
-      if (firstAudioAt === null && event.result.audioData.byteLength > 0) {
-        firstAudioAt = performance.now();
-      }
-      originalSynthesizing(sender, event);
-    };
-  }
-
   try {
-    const google = createGoogle({ apiKey: requiredEnvironment("GEMINI_API_KEY") });
-    const result = streamText({
-      model: google(process.env.GEMINI_MODEL || "gemini-3.1-flash-lite"),
-      system: systemPrompt
+    const providerSignal = options.abortSignal
+      ? AbortSignal.any([options.abortSignal, AbortSignal.timeout(30_000)])
+      : AbortSignal.timeout(30_000);
+    console.info("[avatar] generating response");
+    const generatedText = await generateGeminiReply(
+      systemPrompt
         + "\n\nAlways answer in English unless the user explicitly asks for another language. "
         + "Give a complete answer to the user's question. Do not stop mid-sentence. Keep it suitable for spoken delivery.",
-      messages: toModelMessages([...history, { role: "user", content: text }]),
-      abortSignal: options.abortSignal,
-      temperature: 0.5,
-      maxOutputTokens: 700,
-      providerOptions: {
-        google: { thinkingConfig: { thinkingLevel: "minimal" } },
-      },
-    });
-
-    for await (const chunk of result.textStream) {
-      if (options.abortSignal?.aborted) break;
-      if (!chunk) continue;
-      if (firstTextAt === null) firstTextAt = performance.now();
-      reply += chunk;
+      [...history, { role: "user", content: text }],
+      providerSignal,
+    );
+    console.info("[avatar] response generated");
+    if (generatedText) {
+      firstTextAt = performance.now();
+      reply = generatedText;
       send(ws, {
         type: "response_delta",
         response_id: responseId,
-        text: chunk,
+        text: generatedText,
       });
-      synthesis.request.inputStream.write(chunk);
     }
-    synthesis.request.inputStream.close();
-    await synthesis.completion;
-    if (!synthesis.hasAudio() && reply.trim()) {
+    if (reply.trim()) {
       try {
-        if (await synthesizeFallback(ws, responseId, reply.trim())) synthesis.markAudio();
+        console.info("[avatar] synthesizing response");
+        const fallback = await synthesizeFallback(
+          ws,
+          responseId,
+          reply.trim(),
+          options.voiceId ?? DEFAULT_VOICE_ID,
+        );
+        if (fallback.hasAudio) {
+          hasAudio = true;
+          firstAudioAt = performance.now();
+          fallbackVisemeCount = fallback.visemeCount;
+          fallbackLastVisemeOffsetMs = fallback.lastVisemeOffsetMs;
+        }
+        console.info("[avatar] response synthesized");
       } catch (error) {
         console.warn("[avatar] fallback speech synthesis unavailable", error);
       }
     }
   } catch (error) {
     if (options.abortSignal?.aborted) {
-      if (!synthesis.request.inputStream.isClosed) synthesis.request.inputStream.close();
-      await synthesis.completion.catch(() => undefined);
       return;
     }
-    if (!synthesis.request.inputStream.isClosed) synthesis.request.inputStream.close();
-    await synthesis.completion.catch(() => undefined);
     throw error;
   }
 
@@ -289,7 +423,10 @@ export async function processTextTurn(
     history.splice(0, history.length - MAX_HISTORY_MESSAGES);
   }
 
-  const visemes = synthesis.visemeSummary();
+  const visemes = {
+    count: fallbackVisemeCount,
+    lastOffsetMs: fallbackLastVisemeOffsetMs,
+  };
   console.info("[avatar] streaming turn", {
     firstTextMs: firstTextAt ? Math.round(firstTextAt - startedAt) : null,
     firstAudioMs: firstAudioAt ? Math.round(firstAudioAt - startedAt) : null,
@@ -301,8 +438,105 @@ export async function processTextTurn(
     type: "response_end",
     response_id: responseId,
     text: reply,
-    has_audio: synthesis.hasAudio(),
+    has_audio: hasAudio,
   });
+}
+
+export interface VoicePreview {
+  audio: string;
+  visemes: TimedViseme[];
+}
+
+function approximateVisemes(text: string, durationMs: number): VoicePreview["visemes"] {
+  const phonemes: number[] = [];
+  const normalized = text.toLowerCase();
+  const characterVisemes: Record<string, number> = {
+    a: 2,
+    b: 21,
+    c: 20,
+    d: 19,
+    e: 4,
+    f: 18,
+    g: 20,
+    h: 1,
+    i: 6,
+    j: 16,
+    k: 20,
+    l: 19,
+    m: 21,
+    n: 14,
+    o: 8,
+    p: 21,
+    q: 20,
+    r: 13,
+    s: 15,
+    t: 19,
+    u: 7,
+    v: 18,
+    w: 7,
+    x: 15,
+    y: 6,
+    z: 15,
+  };
+  for (let index = 0; index < normalized.length; index += 1) {
+    const pair = normalized.slice(index, index + 2);
+    let visemeId: number | undefined;
+    if (pair === "th") {
+      visemeId = 17;
+      index += 1;
+    } else if (pair === "sh" || pair === "ch") {
+      visemeId = 16;
+      index += 1;
+    } else {
+      visemeId = characterVisemes[normalized[index]];
+    }
+    if (visemeId !== undefined && phonemes.at(-1) !== visemeId) {
+      phonemes.push(visemeId);
+    }
+  }
+
+  const usableDurationMs = Math.max(200, durationMs - 120);
+  const stepMs = usableDurationMs / Math.max(1, phonemes.length);
+  return [
+    { offset_ms: 0, viseme_id: 0, viseme: "sil" },
+    ...phonemes.map((visemeId, index) => ({
+      offset_ms: 60 + index * stepMs,
+      viseme_id: visemeId,
+      viseme: toOculusViseme(visemeId),
+    })),
+    {
+      offset_ms: Math.max(80, durationMs - 40),
+      viseme_id: 0,
+      viseme: "sil",
+    },
+  ];
+}
+
+export async function synthesizeVoicePreview(
+  voiceId: VoiceId,
+  text: string,
+): Promise<VoicePreview> {
+  try {
+    const timedSpeech = await synthesizeAzureTimedSpeech(
+      text,
+      voiceId,
+      speechSdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm,
+    );
+    return {
+      audio: timedSpeech.audio.toString("base64"),
+      visemes: timedSpeech.visemes,
+    };
+  } catch (error) {
+    console.warn("[avatar] timed preview visemes unavailable; using fallback timing", error);
+  }
+
+  const audio = await fetchAzureSpeech(text, voiceId, "riff-24khz-16bit-mono-pcm");
+  if (audio.byteLength <= 44) throw new Error("Voice preview returned no audio.");
+  const durationMs = (audio.byteLength - 44) / 2 / 24_000 * 1_000;
+  return {
+    audio: audio.toString("base64"),
+    visemes: approximateVisemes(text, durationMs),
+  };
 }
 
 function extensionForMimeType(mimeType: string): string {
@@ -326,7 +560,7 @@ export async function transcribeAudio(audio: Buffer, mimeType: string): Promise<
   );
   form.append("model", "whisper-large-v3-turbo");
   form.append("response_format", "json");
-  const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+  const response = await directFetch("https://api.groq.com/openai/v1/audio/transcriptions", {
     method: "POST",
     headers: { Authorization: `Bearer ${requiredEnvironment("GROQ_API_KEY")}` },
     body: form,

@@ -4,12 +4,23 @@ from __future__ import annotations
 
 import os
 import threading
+import time
+import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 import azure.cognitiveservices.speech as speechsdk
 
 from viseme_map import to_oculus_viseme
+
+logger = logging.getLogger("avatar-chatbot.tts")
+
+VOICE_NAMES = {
+    "nova": "en-US-JennyNeural",
+    "aria": "en-US-AriaNeural",
+    "atlas": "en-US-GuyNeural",
+}
+DEFAULT_VOICE_ID = "nova"
 
 
 @dataclass(frozen=True)
@@ -47,6 +58,17 @@ class TextToSpeechError(RuntimeError):
 _stream_lock = threading.Lock()
 _stream_synthesizer: speechsdk.SpeechSynthesizer | None = None
 _stream_connection: speechsdk.Connection | None = None
+_stream_voice_id: str | None = None
+
+
+def is_voice_id(value: object) -> bool:
+    """Return whether a client-provided voice ID is supported."""
+
+    return isinstance(value, str) and value in VOICE_NAMES
+
+
+def _voice_name(voice_id: str) -> str:
+    return VOICE_NAMES.get(voice_id, VOICE_NAMES[DEFAULT_VOICE_ID])
 
 
 def _speech_credentials() -> tuple[str, str]:
@@ -57,19 +79,29 @@ def _speech_credentials() -> tuple[str, str]:
     return speech_key, region
 
 
-def _get_stream_synthesizer() -> speechsdk.SpeechSynthesizer:
+def _get_stream_synthesizer(
+    voice_id: str = DEFAULT_VOICE_ID,
+) -> speechsdk.SpeechSynthesizer:
     """Create one WebSocket-v2 synthesizer and retain its warm connection."""
 
-    global _stream_connection, _stream_synthesizer
-    if _stream_synthesizer is not None:
+    global _stream_connection, _stream_synthesizer, _stream_voice_id
+    if _stream_synthesizer is not None and _stream_voice_id == voice_id:
         return _stream_synthesizer
+    if _stream_connection is not None:
+        _stream_connection.close()
+    if _stream_synthesizer is not None:
+        _stream_synthesizer.synthesizing.disconnect_all()
+        _stream_synthesizer.viseme_received.disconnect_all()
+    _stream_connection = None
+    _stream_synthesizer = None
+    _stream_voice_id = None
 
     speech_key, region = _speech_credentials()
     config = speechsdk.SpeechConfig(
         endpoint=f"wss://{region}.tts.speech.microsoft.com/cognitiveservices/websocket/v2",
         subscription=speech_key,
     )
-    config.speech_synthesis_voice_name = "en-US-JennyNeural"
+    config.speech_synthesis_voice_name = _voice_name(voice_id)
     config.set_speech_synthesis_output_format(
         speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm
     )
@@ -81,6 +113,7 @@ def _get_stream_synthesizer() -> speechsdk.SpeechSynthesizer:
     )
     _stream_connection = speechsdk.Connection.from_speech_synthesizer(_stream_synthesizer)
     _stream_connection.open(True)
+    _stream_voice_id = voice_id
     return _stream_synthesizer
 
 
@@ -88,7 +121,7 @@ def preconnect_speech() -> None:
     """Warm Azure's WebSocket connection during backend startup."""
 
     with _stream_lock:
-        _get_stream_synthesizer()
+        _get_stream_synthesizer(DEFAULT_VOICE_ID)
 
 
 def synthesize_speech_stream(
@@ -96,6 +129,7 @@ def synthesize_speech_stream(
     on_text: Callable[[str], None],
     on_audio: Callable[[bytes], None],
     on_viseme: Callable[[TimedViseme], None],
+    voice_id: str = DEFAULT_VOICE_ID,
 ) -> StreamingSynthesisResult:
     """Feed LLM deltas directly into Azure and emit raw PCM plus visemes."""
 
@@ -107,7 +141,7 @@ def synthesize_speech_stream(
         tts_error: str | None = None
 
         try:
-            synthesizer = _get_stream_synthesizer()
+            synthesizer = _get_stream_synthesizer(voice_id)
         except Exception as error:
             synthesizer = None
             tts_error = str(error)
@@ -187,42 +221,79 @@ def synthesize_speech_stream(
         )
 
 
-def synthesize_speech(text: str) -> SynthesisResult:
+def synthesize_speech(
+    text: str,
+    voice_id: str = DEFAULT_VOICE_ID,
+) -> SynthesisResult:
     """Synthesize a browser-playable WAV payload and collect Azure callbacks."""
 
     speech_key, region = _speech_credentials()
 
-    visemes: list[TimedViseme] = []
-    try:
-        config = speechsdk.SpeechConfig(subscription=speech_key, region=region)
-        config.speech_synthesis_voice_name = "en-US-JennyNeural"
-        config.set_speech_synthesis_output_format(
-            speechsdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
-        )
-        synthesizer = speechsdk.SpeechSynthesizer(speech_config=config, audio_config=None)
-
-        def capture_viseme(event: speechsdk.SpeechSynthesisVisemeEventArgs) -> None:
-            # Azure reports ticks in 100-nanosecond units; TalkingHead uses ms.
-            viseme_id = int(event.viseme_id)
-            visemes.append(
-                TimedViseme(
-                    offset_ms=event.audio_offset / 10_000,
-                    viseme_id=viseme_id,
-                    viseme=to_oculus_viseme(viseme_id),
-                )
+    def synthesize_once() -> SynthesisResult:
+        visemes: list[TimedViseme] = []
+        synthesizer: speechsdk.SpeechSynthesizer | None = None
+        connection: speechsdk.Connection | None = None
+        try:
+            config = speechsdk.SpeechConfig(subscription=speech_key, region=region)
+            config.speech_synthesis_voice_name = _voice_name(voice_id)
+            config.set_speech_synthesis_output_format(
+                speechsdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
             )
+            synthesizer = speechsdk.SpeechSynthesizer(
+                speech_config=config,
+                audio_config=None,
+            )
+            connection = speechsdk.Connection.from_speech_synthesizer(synthesizer)
 
-        synthesizer.viseme_received.connect(capture_viseme)
-        result = synthesizer.speak_text_async(text).get()
-    except Exception as error:
-        raise TextToSpeechError("Voice synthesis is temporarily unavailable.") from error
+            def capture_viseme(event: speechsdk.SpeechSynthesisVisemeEventArgs) -> None:
+                # Azure reports ticks in 100-nanosecond units; TalkingHead uses ms.
+                viseme_id = int(event.viseme_id)
+                visemes.append(
+                    TimedViseme(
+                        offset_ms=event.audio_offset / 10_000,
+                        viseme_id=viseme_id,
+                        viseme=to_oculus_viseme(viseme_id),
+                    )
+                )
 
-    if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted or not result.audio_data:
-        raise TextToSpeechError("Voice synthesis returned no audio.")
-    if not visemes:
-        raise TextToSpeechError("Voice synthesis returned no lip-sync timing.")
+            synthesizer.viseme_received.connect(capture_viseme)
+            result = synthesizer.speak_text_async(text).get()
+            if (
+                result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted
+                or not result.audio_data
+            ):
+                if result.reason == speechsdk.ResultReason.Canceled:
+                    details = speechsdk.SpeechSynthesisCancellationDetails(result)
+                    raise TextToSpeechError(
+                        f"Azure canceled synthesis: {details.error_code}; "
+                        f"{details.error_details or details.reason}"
+                    )
+                raise TextToSpeechError("Voice synthesis returned no audio.")
+            if not visemes:
+                raise TextToSpeechError("Voice synthesis returned no lip-sync timing.")
 
-    # Azure callbacks are normally ordered, but sorting here makes the renderer's
-    # animation timeline deterministic even if callback delivery changes.
-    visemes.sort(key=lambda viseme: viseme.offset_ms)
-    return SynthesisResult(audio=bytes(result.audio_data), visemes=visemes)
+            # Azure callbacks are normally ordered, but sorting here makes the
+            # renderer's animation timeline deterministic.
+            visemes.sort(key=lambda viseme: viseme.offset_ms)
+            return SynthesisResult(audio=bytes(result.audio_data), visemes=visemes)
+        finally:
+            if synthesizer is not None:
+                synthesizer.viseme_received.disconnect_all()
+            if connection is not None:
+                connection.close()
+
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            return synthesize_once()
+        except Exception as error:
+            last_error = error
+            logger.warning(
+                "Voice preview synthesis attempt %d failed: %s",
+                attempt + 1,
+                error,
+            )
+            if attempt == 0:
+                time.sleep(0.25)
+
+    raise TextToSpeechError("Voice synthesis is temporarily unavailable.") from last_error

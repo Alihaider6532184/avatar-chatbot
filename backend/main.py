@@ -12,15 +12,24 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 load_dotenv()
 
 from services.llm import ChatMessage, LlmError, generate_reply_stream
 from services.stt import SpeechToTextError, transcribe_audio
-from services.tts import StreamingSynthesisResult, preconnect_speech, synthesize_speech_stream
+from services.tts import (
+    DEFAULT_VOICE_ID,
+    StreamingSynthesisResult,
+    TextToSpeechError,
+    is_voice_id,
+    preconnect_speech,
+    synthesize_speech,
+    synthesize_speech_stream,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("avatar-chatbot")
@@ -35,6 +44,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class VoicePreviewRequest(BaseModel):
+    """Validated voice sample request from the Next.js UI."""
+
+    voice_id: str
+
+
+_voice_preview_cache: dict[str, dict[str, object]] = {}
+_voice_preview_lock = asyncio.Lock()
 
 
 async def _timed_stage(name: str, operation: Callable[..., Any], *args: Any) -> Any:
@@ -70,7 +89,10 @@ def _parse_text_message(raw_message: str) -> str:
 
 
 async def _process_turn(
-    websocket: WebSocket, history: list[ChatMessage], user_text: str
+    websocket: WebSocket,
+    history: list[ChatMessage],
+    user_text: str,
+    voice_id: str = DEFAULT_VOICE_ID,
 ) -> None:
     """Stream Gemini text into Azure so audio starts before the reply is complete."""
 
@@ -111,6 +133,7 @@ async def _process_turn(
             on_viseme=lambda viseme: emit(
                 {"type": "response_viseme", "viseme": viseme.__dict__}
             ),
+            voice_id=voice_id,
         )
 
     worker = asyncio.create_task(asyncio.to_thread(run_turn))
@@ -176,6 +199,41 @@ async def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/voice-preview")
+async def voice_preview(payload: VoicePreviewRequest) -> dict[str, object]:
+    """Return a short WAV sample and matching lip-sync cues for one voice."""
+
+    if not is_voice_id(payload.voice_id):
+        raise HTTPException(status_code=400, detail="Unsupported avatar voice.")
+    async with _voice_preview_lock:
+        cached = _voice_preview_cache.get(payload.voice_id)
+        if cached is not None:
+            return cached
+
+        text = "Hello! I'm ready to bring your ideas to life. How can I help today?"
+        try:
+            result = await _timed_stage(
+                "TTS preview",
+                synthesize_speech,
+                text,
+                payload.voice_id,
+            )
+        except TextToSpeechError as error:
+            logger.warning("Voice preview unavailable: %s", error)
+            raise HTTPException(
+                status_code=503,
+                detail="The voice preview is temporarily unavailable.",
+            ) from error
+
+        response: dict[str, object] = {
+            "audio": base64.b64encode(result.audio).decode("ascii"),
+            "text": text,
+            "visemes": [viseme.__dict__ for viseme in result.visemes],
+        }
+        _voice_preview_cache[payload.voice_id] = response
+        return response
+
+
 @app.websocket("/ws/chat")
 async def chat_websocket(websocket: WebSocket) -> None:
     """Accept typed JSON or binary MediaRecorder audio for one chat session."""
@@ -183,6 +241,7 @@ async def chat_websocket(websocket: WebSocket) -> None:
     await websocket.accept()
     history: list[ChatMessage] = []
     audio_mime_type = "audio/webm"
+    voice_id = DEFAULT_VOICE_ID
     logger.info("WebSocket client connected")
 
     try:
@@ -207,6 +266,13 @@ async def chat_websocket(websocket: WebSocket) -> None:
                     else:
                         await _send_error(websocket, "Unsupported audio recording format.")
                     continue
+                if envelope and envelope.get("type") == "session_config":
+                    requested_voice = envelope.get("voice_id")
+                    if is_voice_id(requested_voice):
+                        voice_id = requested_voice
+                    else:
+                        await _send_error(websocket, "Unsupported avatar voice.")
+                    continue
                 try:
                     user_text = _parse_text_message(raw_text)
                 except ValueError as error:
@@ -229,7 +295,7 @@ async def chat_websocket(websocket: WebSocket) -> None:
                 await _send_error(websocket, "Unsupported WebSocket message.")
                 continue
 
-            await _process_turn(websocket, history, user_text)
+            await _process_turn(websocket, history, user_text, voice_id)
     except WebSocketDisconnect:
         pass
     except Exception:

@@ -5,16 +5,6 @@ import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "re
 import { Box3, MathUtils, Vector3, type Camera, type Group, type PerspectiveCamera } from "three";
 import type { ChatResponse, TimedViseme } from "@/lib/wsClient";
 
-// Some corporate/ISP DNS resolvers block models.readyplayer.me. This public
-// TalkingHead reference model keeps the renderer usable until an RPM URL is reachable.
-const FALLBACK_AVATAR_URL = "https://raw.githubusercontent.com/met4citizen/TalkingHead/main/avatars/brunette.glb";
-const CONFIGURED_AVATAR_URL = process.env.NEXT_PUBLIC_AVATAR_URL?.trim();
-
-// Set NEXT_PUBLIC_AVATAR_URL to use an RPM export with Oculus viseme morph targets.
-// Without an explicit URL, use the compatible reference avatar directly so a known
-// blocked RPM hostname does not create a failed request on every page load.
-export const READY_PLAYER_ME_AVATAR_URL = CONFIGURED_AVATAR_URL || FALLBACK_AVATAR_URL;
-
 interface TalkingHeadLike {
   armature: Group;
   audioCtx: AudioContext;
@@ -58,6 +48,7 @@ interface TalkingHeadLike {
   streamInterrupt: () => void;
   setMood: (mood: string) => void;
   stop: () => void;
+  dispose: () => void;
 }
 
 export interface AvatarHandle {
@@ -71,6 +62,7 @@ export interface AvatarHandle {
 }
 
 interface AvatarProps {
+  avatarUrl?: string | null;
   onReady: (usingFallback: boolean) => void;
   onSpeechStart: () => void;
   onSpeechEnd: () => void;
@@ -187,6 +179,49 @@ interface LipSyncPayload {
   vdurations: number[];
 }
 
+function buildTextLipSync(
+  text: string,
+  audio: ArrayBuffer,
+  sampleRate: number,
+  processor: TalkingHeadLike["lipsync"][string],
+): LipSyncPayload {
+  const timing = buildAudioAwareWordTiming(text, audio, sampleRate);
+  const result: LipSyncPayload = { visemes: [], vtimes: [], vdurations: [] };
+
+  timing.words.forEach((word, wordIndex) => {
+    const converted = processor.wordsToVisemes(processor.preProcessText(word));
+    const finalIndex = converted.visemes.length - 1;
+    const sourceDuration = finalIndex >= 0
+      ? converted.times[finalIndex] + converted.durations[finalIndex]
+      : 0;
+    if (!Number.isFinite(sourceDuration) || sourceDuration <= 0) return;
+
+    const wordDuration = Math.max(40, timing.wdurations[wordIndex]);
+    converted.visemes.forEach((viseme, visemeIndex) => {
+      if (!OCULUS_VISEMES.has(viseme)) return;
+      result.visemes.push(viseme);
+      result.vtimes.push(
+        timing.wtimes[wordIndex] + converted.times[visemeIndex] / sourceDuration * wordDuration,
+      );
+      result.vdurations.push(
+        Math.max(40, converted.durations[visemeIndex] / sourceDuration * wordDuration),
+      );
+    });
+  });
+
+  return result;
+}
+
+function buildSyntheticLipSync(startMs: number, durationMs: number): LipSyncPayload {
+  const visemes = ["aa", "E", "O", "PP", "I", "sil"];
+  const cueDuration = Math.max(45, durationMs / visemes.length);
+  return {
+    visemes,
+    vtimes: visemes.map((_, index) => startMs + index * cueDuration),
+    vdurations: visemes.map(() => cueDuration),
+  };
+}
+
 function takeReadyVisemes(queue: TimedViseme[], includeFinalViseme: boolean): LipSyncPayload | null {
   const count = includeFinalViseme ? queue.length : Math.max(0, queue.length - 1);
   if (!count) return null;
@@ -252,18 +287,31 @@ function frameUpperBody(camera: Camera, armature: Group) {
   perspectiveCamera.updateProjectionMatrix();
 }
 
-function AvatarScene({ onHeadReady, onError }: { onHeadReady: (head: TalkingHeadLike, usingFallback: boolean) => void; onError: (message: string) => void }) {
+function AvatarScene({
+  avatarUrl,
+  onLoadStart,
+  onHeadReady,
+  onError,
+}: {
+  avatarUrl: string;
+  onLoadStart: () => void;
+  onHeadReady: (head: TalkingHeadLike, usingFallback: boolean) => void;
+  onError: (message: string) => void;
+}) {
   const { camera, scene } = useThree();
   const headRef = useRef<TalkingHeadLike | null>(null);
+  const onLoadStartRef = useRef(onLoadStart);
   const onHeadReadyRef = useRef(onHeadReady);
   const onErrorRef = useRef(onError);
 
+  useEffect(() => { onLoadStartRef.current = onLoadStart; }, [onLoadStart]);
   useEffect(() => { onHeadReadyRef.current = onHeadReady; }, [onHeadReady]);
   useEffect(() => { onErrorRef.current = onError; }, [onError]);
 
   useEffect(() => {
     let cancelled = false;
     let head: TalkingHeadLike | null = null;
+    onLoadStartRef.current();
     const loadAvatar = async () => {
       try {
         const talkingHeadModule = (await import("@met4citizen/talkinghead")) as unknown as { TalkingHead: new (node: HTMLElement, options: object) => TalkingHeadLike };
@@ -275,42 +323,36 @@ function AvatarScene({ onHeadReady, onError }: { onHeadReady: (head: TalkingHead
         });
         const { LipsyncEn } = await import("@met4citizen/talkinghead/modules/lipsync-en.mjs");
         head.lipsync.en = new LipsyncEn();
-        const avatarUrls = CONFIGURED_AVATAR_URL
-          ? [CONFIGURED_AVATAR_URL, FALLBACK_AVATAR_URL]
-          : [FALLBACK_AVATAR_URL];
-        let loadedUrl: string | null = null;
-        for (const avatarUrl of avatarUrls) {
-          try {
-            await head.showAvatar({ url: avatarUrl, body: "F", avatarMood: "neutral" });
-            loadedUrl = avatarUrl;
-            break;
-          } catch {
-            // Try the fallback only after the configured Ready Player Me URL fails.
-          }
-        }
-        if (!loadedUrl) throw new Error("No avatar model could be loaded");
+        await head.showAvatar({ url: avatarUrl, body: "F", avatarMood: "neutral" });
         if (cancelled) return;
         scene.add(head.armature);
         frameUpperBody(camera, head.armature);
         headRef.current = head;
-        onHeadReadyRef.current(head, Boolean(CONFIGURED_AVATAR_URL && loadedUrl === FALLBACK_AVATAR_URL));
+        onHeadReadyRef.current(head, false);
       } catch {
-        onErrorRef.current("The 3D avatar could not be loaded. Check the Ready Player Me URL and connection.");
+        onErrorRef.current("The uploaded GLB could not be loaded by the talking-avatar engine.");
       }
     };
     void loadAvatar();
     return () => {
       cancelled = true;
+      headRef.current = null;
       if (head?.armature) scene.remove(head.armature);
-      head?.stop();
+      head?.dispose();
     };
-  }, [camera, scene]);
+  }, [avatarUrl, camera, scene]);
 
   useFrame((_, delta) => headRef.current?.animate(delta * 1_000));
   return <ambientLight intensity={1.5} />;
 }
 
-export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ onReady, onSpeechStart, onSpeechEnd, onError }, ref) {
+export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({
+  avatarUrl = null,
+  onReady,
+  onSpeechStart,
+  onSpeechEnd,
+  onError,
+}, ref) {
   const [head, setHead] = useState<TalkingHeadLike | null>(null);
   const speechEndTimerRef = useRef<number | null>(null);
   const streamReadyRef = useRef<Promise<boolean> | null>(null);
@@ -319,11 +361,13 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
   const queuedAudioRef = useRef<QueuedAudioChunk[]>([]);
   const queuedVisemesRef = useRef<TimedViseme[]>([]);
   const releasedAudioDurationMsRef = useRef(0);
+  const releasedLipSyncRef = useRef(false);
 
   const resetStreamBuffers = () => {
     queuedAudioRef.current = [];
     queuedVisemesRef.current = [];
     releasedAudioDurationMsRef.current = 0;
+    releasedLipSyncRef.current = false;
   };
 
   const flushStreamBuffers = (activeHead: TalkingHeadLike, force = false) => {
@@ -336,13 +380,19 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
 
       if (nextAudio.text) {
         queuedAudioRef.current.shift();
-        const timing = buildAudioAwareWordTiming(nextAudio.text, nextAudio.audio, nextAudio.sampleRate);
+        const lipSync = buildTextLipSync(
+          nextAudio.text,
+          nextAudio.audio,
+          nextAudio.sampleRate,
+          activeHead.lipsync.en,
+        );
         activeHead.streamAudio({
           audio: nextAudio.audio,
-          words: timing.words,
-          wtimes: timing.wtimes.map((time) => releasedAudioDurationMsRef.current + time),
-          wdurations: timing.wdurations,
+          visemes: lipSync.visemes,
+          vtimes: lipSync.vtimes.map((time) => releasedAudioDurationMsRef.current + time),
+          vdurations: lipSync.vdurations,
         });
+        releasedLipSyncRef.current ||= lipSync.visemes.length > 0;
         releasedAudioDurationMsRef.current += nextAudio.durationMs;
         continue;
       }
@@ -350,11 +400,18 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
       if (!force && (!latestViseme || latestViseme.offset_ms < requiredVisemeOffset)) break;
 
       queuedAudioRef.current.shift();
-      const lipSync = takeReadyVisemes(queuedVisemesRef.current, force);
+      let lipSync = takeReadyVisemes(queuedVisemesRef.current, force);
+      if (force && !lipSync && !releasedLipSyncRef.current) {
+        lipSync = buildSyntheticLipSync(
+          releasedAudioDurationMsRef.current,
+          nextAudio.durationMs,
+        );
+      }
       activeHead.streamAudio({
         audio: nextAudio.audio,
         ...(lipSync ?? {}),
       });
+      releasedLipSyncRef.current ||= Boolean(lipSync?.visemes.length);
       releasedAudioDurationMsRef.current += nextAudio.durationMs;
     }
   };
@@ -425,8 +482,7 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
               // Keep the context created with the avatar. Replacing it after a
               // network response loses Chrome's click-based autoplay grant.
               sampleRate: head.audioCtx.sampleRate,
-              lipsyncType: "words",
-              lipsyncLang: "en",
+              lipsyncType: "visemes",
               waitForAudioChunks: true,
               mood: "neutral",
             },
@@ -480,31 +536,6 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
         flushStreamBuffers(head);
         return;
       }
-      // If Azure did not provide viseme events, keep the mouth animated with
-      // deterministic fallback cues aligned to each PCM chunk.
-      const queuedAudioBeforeThis = queuedAudioRef.current
-        .slice(0, -1)
-        .reduce((total, chunk) => total + chunk.durationMs, 0);
-      const syntheticStart = releasedAudioDurationMsRef.current + queuedAudioBeforeThis;
-      const hasSpeechCuesForChunk = queuedVisemesRef.current.some(
-        (cue) => cue.offset_ms >= syntheticStart && cue.viseme !== "sil",
-      );
-      if (!hasSpeechCuesForChunk) {
-        const chunkDuration = sourceAudio.byteLength / 2 / streamSourceRateRef.current * 1_000;
-        const cueDuration = Math.max(45, chunkDuration / 6);
-        ["aa", "E", "O", "PP", "I", "sil"].forEach((viseme, index) => queuedVisemesRef.current.push({
-          offset_ms: syntheticStart + index * cueDuration,
-          viseme_id: -1,
-          viseme,
-        }));
-        // This look-ahead marker lets flushStreamBuffers release the PCM and
-        // its mouth cues together instead of holding the audio until stream end.
-        queuedVisemesRef.current.push({
-          offset_ms: syntheticStart + chunkDuration + LIP_SYNC_LOOK_AHEAD_MS,
-          viseme_id: -1,
-          viseme: "sil",
-        });
-      }
       flushStreamBuffers(head);
     },
     pushStreamViseme: async (viseme) => {
@@ -531,13 +562,17 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
         onSpeechEnd();
         return;
       }
+      // Flush the final PCM block together with its complete Azure viseme
+      // timeline. Passing visemes separately before the audio can shift the
+      // mouth animation by one renderer frame on full-response synthesis.
+      flushStreamBuffers(head, true);
       const remainingLipSync = takeReadyVisemes(queuedVisemesRef.current, true);
       if (remainingLipSync) {
         head.streamAudio({
           ...remainingLipSync,
         });
+        releasedLipSyncRef.current = true;
       }
-      flushStreamBuffers(head, true);
       head.streamNotifyEnd();
     },
     cancelStream: () => {
@@ -553,7 +588,27 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({ on
       <Canvas camera={{ position: [0, 1.5, 2.5], fov: 28 }} dpr={[1, 2]}>
         <color attach="background" args={["#0b1728"]} />
         <directionalLight intensity={2.5} position={[2, 4, 3]} />
-        <AvatarScene onError={onError} onHeadReady={(loadedHead, usingFallback) => { setHead(loadedHead); onReady(usingFallback); }} />
+        {avatarUrl ? (
+          <AvatarScene
+            avatarUrl={avatarUrl}
+            onError={onError}
+            onLoadStart={() => {
+              streamSessionRef.current += 1;
+              streamReadyRef.current = null;
+              resetStreamBuffers();
+              setHead((currentHead) => {
+                currentHead?.streamInterrupt();
+                return null;
+              });
+            }}
+            onHeadReady={(loadedHead, usingFallback) => {
+              setHead(loadedHead);
+              onReady(usingFallback);
+            }}
+          />
+        ) : (
+          <ambientLight intensity={1.5} />
+        )}
       </Canvas>
     </div>
   );

@@ -1,3 +1,5 @@
+import type { VoiceId } from "@/lib/voices";
+
 export type ConnectionState = "connecting" | "connected" | "reconnecting" | "disconnected";
 
 export interface TimedViseme {
@@ -133,11 +135,12 @@ export class ChatWebSocketClient {
     this.socket?.send(JSON.stringify({ type: "cancel" }));
   }
 
-  public setSessionConfig(systemPrompt: string, workspaceId: string): void {
+  public setSessionConfig(systemPrompt: string, workspaceId: string, voiceId: VoiceId): void {
     const action = (socket: WebSocket) => socket.send(JSON.stringify({
       type: "session_config",
       system_prompt: systemPrompt,
       workspace_id: workspaceId,
+      voice_id: voiceId,
     }));
     if (!this.isOpen()) {
       this.pendingActions.push(action);

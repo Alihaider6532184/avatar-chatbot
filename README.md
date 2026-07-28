@@ -58,6 +58,12 @@ The local health endpoint is available at `http://localhost:8000/health`.
 
 `READY_PLAYER_ME_AVATAR_URL` at the top of `frontend/components/Avatar.tsx` is the configurable default avatar. For best lip-sync, use a Ready Player Me export that includes Oculus viseme morph targets.
 
+### Avatar and voice personalization
+
+- Use **Upload GLB** below the avatar to load a custom model for the current browser session. Files are validated in the browser and are never uploaded to the server. Humanoid GLBs with Oculus or ARKit facial morph targets give the best lip-sync results.
+- Choose from Nova, Aria, or Atlas. **Preview** generates a short Azure Speech sample and animates the avatar with the returned visemes; selecting a card uses that voice for future replies. The selected voice is remembered in local storage.
+- With the documented split frontend/backend setup, `/api/voice-preview` proxies to `BACKEND_HTTP_URL` (or derives it from `NEXT_PUBLIC_WS_URL`). In an integrated deployment with Azure variables available to Next.js, it synthesizes the sample directly.
+
 ## Pipeline
 
 1. The client sends either a typed JSON message or a binary `MediaRecorder` audio blob through `/ws/chat`.
