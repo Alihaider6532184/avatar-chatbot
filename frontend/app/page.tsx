@@ -1,6 +1,14 @@
 "use client";
 
-import { type ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
+import {
+  type ChangeEvent,
+  FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { Avatar, type AvatarHandle } from "@/components/Avatar";
 import { AvatarCustomizer } from "@/components/AvatarCustomizer";
 import { ChatLog, type ChatMessage } from "@/components/ChatLog";
@@ -35,6 +43,17 @@ interface VoicePreviewResponse {
 
 const MAX_AVATAR_BYTES = 50 * 1024 * 1024;
 const VOICE_STORAGE_KEY = "pitb-avatar-voice";
+const CHAT_HEIGHT_STORAGE_KEY = "pitb-avatar-chat-height";
+const CHAT_PANEL_MIN_HEIGHT = 360;
+const CHAT_PANEL_DEFAULT_HEIGHT = 430;
+const CHAT_PANEL_MAX_HEIGHT = 680;
+
+function clampChatPanelHeight(height: number): number {
+  return Math.min(
+    CHAT_PANEL_MAX_HEIGHT,
+    Math.max(CHAT_PANEL_MIN_HEIGHT, height),
+  );
+}
 
 function websocketUrl(): string {
   const configuredUrl = process.env.NEXT_PUBLIC_WS_URL?.trim();
@@ -58,6 +77,8 @@ export default function HomePage() {
   const cancelledResponseIdsRef = useRef(new Set<string>());
   const customAvatarUrlRef = useRef<string | null>(null);
   const previewRequestRef = useRef<AbortController | null>(null);
+  const chatResizeStartRef = useRef({ height: CHAT_PANEL_DEFAULT_HEIGHT, y: 0 });
+  const resizingChatRef = useRef(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
@@ -78,6 +99,8 @@ export default function HomePage() {
   const [avatarStatus, setAvatarStatus] = useState("Upload a compatible GLB avatar to begin.");
   const [selectedVoice, setSelectedVoice] = useState<VoiceId>(DEFAULT_VOICE_ID);
   const [previewingVoice, setPreviewingVoice] = useState<VoiceId | null>(null);
+  const [chatPanelHeight, setChatPanelHeight] = useState(CHAT_PANEL_DEFAULT_HEIGHT);
+  const [resizingChat, setResizingChat] = useState(false);
 
   const addMessage = (role: ChatMessage["role"], content: string) => {
     setMessages((current) => [...current, { id: crypto.randomUUID(), role, content }]);
@@ -174,6 +197,12 @@ export default function HomePage() {
     const timer = window.setTimeout(() => {
       const savedVoice = window.localStorage.getItem(VOICE_STORAGE_KEY);
       if (isVoiceId(savedVoice)) setSelectedVoice(savedVoice);
+      const savedChatHeight = Number(
+        window.localStorage.getItem(CHAT_HEIGHT_STORAGE_KEY),
+      );
+      if (Number.isFinite(savedChatHeight) && savedChatHeight > 0) {
+        setChatPanelHeight(clampChatPanelHeight(savedChatHeight));
+      }
     }, 0);
     return () => {
       window.clearTimeout(timer);
@@ -373,7 +402,61 @@ export default function HomePage() {
     setAvatarState("listening");
   };
 
+  const setAndStoreChatPanelHeight = (height: number) => {
+    const nextHeight = clampChatPanelHeight(height);
+    setChatPanelHeight(nextHeight);
+    window.localStorage.setItem(CHAT_HEIGHT_STORAGE_KEY, String(nextHeight));
+  };
+
+  const startChatResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    chatResizeStartRef.current = {
+      height: chatPanelHeight,
+      y: event.clientY,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    resizingChatRef.current = true;
+    setResizingChat(true);
+  };
+
+  const moveChatResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!resizingChatRef.current) return;
+    const nextHeight = chatResizeStartRef.current.height
+      + event.clientY
+      - chatResizeStartRef.current.y;
+    setChatPanelHeight(clampChatPanelHeight(nextHeight));
+  };
+
+  const finishChatResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!resizingChatRef.current) return;
+    const nextHeight = clampChatPanelHeight(
+      chatResizeStartRef.current.height
+        + event.clientY
+        - chatResizeStartRef.current.y,
+    );
+    resizingChatRef.current = false;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setChatPanelHeight(nextHeight);
+    setResizingChat(false);
+    window.localStorage.setItem(CHAT_HEIGHT_STORAGE_KEY, String(nextHeight));
+  };
+
+  const resizeChatWithKeyboard = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    let nextHeight: number | null = null;
+    if (event.key === "ArrowDown") nextHeight = chatPanelHeight + 32;
+    if (event.key === "ArrowUp") nextHeight = chatPanelHeight - 32;
+    if (event.key === "Home") nextHeight = CHAT_PANEL_MIN_HEIGHT;
+    if (event.key === "End") nextHeight = CHAT_PANEL_MAX_HEIGHT;
+    if (nextHeight === null) return;
+    event.preventDefault();
+    setAndStoreChatPanelHeight(nextHeight);
+  };
+
   const busy = avatarState === "thinking" || avatarState === "speaking";
+  const setupPanelHeight = CHAT_PANEL_MAX_HEIGHT - chatPanelHeight;
+  const showSetupPanels = setupPanelHeight >= 72;
 
   return (
     <main className="mx-auto flex min-h-screen max-w-7xl items-center p-4 sm:p-8">
@@ -434,7 +517,16 @@ export default function HomePage() {
             </span>
           </div>
 
-          <div className="mb-4 rounded-2xl border border-slate-800 bg-slate-900/70 p-3">
+          <div
+            aria-hidden={!showSetupPanels}
+            className={`order-3 min-h-0 overflow-y-auto transition-[max-height,opacity] duration-200 ${
+              showSetupPanels ? "opacity-100" : "pointer-events-none opacity-0"
+            }`}
+            style={{ maxHeight: setupPanelHeight }}
+          >
+            {showSetupPanels && (
+              <div className="space-y-4">
+          <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-3">
             <button
               className="flex w-full items-center justify-between text-left text-sm font-semibold text-cyan-200"
               onClick={() => setShowInstructions((visible) => !visible)}
@@ -458,7 +550,7 @@ export default function HomePage() {
             )}
           </div>
 
-          <div className="mb-4 rounded-2xl border border-slate-800 bg-slate-900/70 p-3">
+          <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-3">
             <div className="flex items-center justify-between gap-3">
               <div>
                 <p className="text-sm font-semibold text-cyan-200">Knowledge documents</p>
@@ -484,8 +576,15 @@ export default function HomePage() {
             )}
             {documentStatus && <p className="mt-2 text-xs text-slate-400">{documentStatus}</p>}
           </div>
+              </div>
+            )}
+          </div>
 
-          <ChatLog messages={messages} />
+          <div
+            className="order-1 flex shrink-0 flex-col rounded-2xl border border-slate-800 bg-slate-950/30 p-3 sm:p-4"
+            style={{ height: chatPanelHeight }}
+          >
+            <ChatLog messages={messages} />
 
           <form className="mt-4 flex gap-2 border-t border-slate-800 pt-4" onSubmit={sendText}>
             <input
@@ -517,7 +616,35 @@ export default function HomePage() {
             >
               Send
             </button>
-          </form>
+            </form>
+          </div>
+
+          <div
+            aria-label="Resize conversation panel"
+            aria-orientation="horizontal"
+            aria-valuemax={CHAT_PANEL_MAX_HEIGHT}
+            aria-valuemin={CHAT_PANEL_MIN_HEIGHT}
+            aria-valuenow={Math.round(chatPanelHeight)}
+            className={`group relative order-2 flex h-8 shrink-0 touch-none cursor-row-resize items-center justify-center outline-none ${
+              resizingChat ? "text-cyan-200" : "text-slate-500"
+            } focus-visible:ring-2 focus-visible:ring-cyan-400/70`}
+            onDoubleClick={() => setAndStoreChatPanelHeight(CHAT_PANEL_DEFAULT_HEIGHT)}
+            onKeyDown={resizeChatWithKeyboard}
+            onLostPointerCapture={() => {
+              resizingChatRef.current = false;
+              setResizingChat(false);
+            }}
+            onPointerCancel={finishChatResize}
+            onPointerDown={startChatResize}
+            onPointerMove={moveChatResize}
+            onPointerUp={finishChatResize}
+            role="separator"
+            tabIndex={0}
+            title="Drag to resize the conversation panel. Double-click to reset."
+          >
+            <span className="h-1.5 w-20 rounded-full bg-slate-700 transition group-hover:bg-cyan-400 group-focus-visible:bg-cyan-400" />
+            <span className="sr-only">Use the up and down arrow keys to resize the conversation panel.</span>
+          </div>
         </div>
       </section>
     </main>

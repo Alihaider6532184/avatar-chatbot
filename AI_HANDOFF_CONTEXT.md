@@ -1,114 +1,140 @@
-# AI Handoff Context — Avatar Chatbot
+# AI Handoff Context — PITB Avatar Chatbot
 
-Read this file together with PROJECT_TECHNICAL_DOCUMENTATION.md. The technical document describes source-level behavior; this file records project history, decisions, failures, fixes, deployment context, branch policy, and continuation rules.
+Read this file together with `PROJECT_TECHNICAL_DOCUMENTATION.md`.
 
-## 1. What was built
+## Current production state
 
-This is a 3D voice/chat avatar for PITB. React Three Fiber renders a TalkingHead-compatible GLB avatar. Typed text or a completed browser MediaRecorder recording travels over WebSocket. The primary Node/Next server performs Groq Whisper batch STT, optional Gemini-embedding/Supabase pgvector retrieval, streamed Gemini generation, Azure Speech TextStream synthesis, and timed Azure visemes. The browser buffers raw PCM and viseme events and schedules TalkingHead mouth animation.
+- Live URL: `https://avatar-chatbot-psi.vercel.app`
+- Primary platform: Vercel
+- Primary code path: `frontend/app/api/ws/route.ts` + `frontend/lib/server/avatarPipeline.ts`
+- Active development branch: `development`
+- Default remote branch: `main`
+- Current UI starts with no avatar.
+- User must upload a compatible Oculus-viseme GLB.
+- Voices: Nova, Aria, Atlas.
+- Production documents use Supabase when configured.
+- Chat appears above setup panels and is vertically resizable.
 
-The repository also contains a separate FastAPI implementation under backend. It has /health and /ws/chat, Python Groq STT, Python Gemini streaming, and Python Azure streaming TTS, but no RAG or document routes. It is not imported by the current Next route.
+## Memory status
 
-## 2. Repository history
+The current project has short-term session memory only:
 
-The frontend originally contained its own nested .git while backend was outside the repository. Adding frontend as a directory would have produced a gitlink, so the frontend metadata was promoted to the project root and the source was staged as frontend/ plus backend/. Git recognized the frontend move as renames and preserved its history.
+- per WebSocket connection,
+- most recent 12 user/assistant messages,
+- not stored in a database,
+- lost on refresh/disconnect.
 
-Remote: https://github.com/Alihaider6532184/avatar-chatbot
+Do not describe document RAG as conversation memory.
 
-Current branch meanings:
+## Current provider behavior
 
-- main: older remote default branch.
-- safe: protected/live baseline, currently at documentation commit dffe10c.
-- development: active upgrade branch, starts at the same baseline.
-- agent/publish-complete-project: historical publishing branch.
+- Audio STT: Groq `whisper-large-v3-turbo`
+- LLM: direct Gemini `generateContent`, default `gemini-3.1-flash-lite`
+- TTS: Azure Speech SDK `speakTextAsync`
+- Conversation audio: raw 24 kHz, 16-bit, mono PCM
+- Preview audio: RIFF 24 kHz, 16-bit, mono PCM
+- Lip-sync: exact Azure `visemeReceived` offsets mapped to Oculus names
+- Fallback: Azure REST audio plus browser audio-aware mouth cues
 
-The production host must be configured to deploy safe. Creating a branch does not change a Vercel Production Branch setting.
+## Critical timing rules
 
-## 3. Voice incident context
+1. Preserve `response_id` on all response events.
+2. Initialize TalkingHead stream before applying audio.
+3. Do not apply late visemes directly without the cumulative PCM timeline.
+4. Keep the 160 ms viseme look-ahead unless retested.
+5. Flush final PCM and remaining visemes in the same operation.
+6. Wait for the stream operation queue before ending speech.
+7. Keep explicit silence cues during quiet audio.
 
-The reported symptom was that the reopened site did not produce audible voice. Local provider values are in backend/.env; frontend/.env.local, frontend/.env.development.local, and frontend/.env.vercel are ignored local/deployment snapshots. Only backend/.env.example is committed and all values there are empty.
+## GLB rules
 
-A critical deployment-path mismatch exists:
+The current validator requires:
 
-- frontend/app/api/ws/route.ts calls createSpeechSession() and passes Azure SpeechSession to processTextTurn.
-- frontend/server.mjs passes null as the session argument. beginSynthesis() treats null as a no-op synthesis object. In that custom-server mode, text may stream while Azure audio is never generated unless a real SpeechSession is created and closed.
+- GLB 2.0,
+- skin,
+- `Armature`, `Hips`, and `Head`,
+- facial morph targets,
+- complete required Oculus viseme target names.
 
-When debugging, first identify which server is live. Inspect WebSocket frames in order: response_start, response_delta, response_audio, response_viseme, response_end.
+The avatar file stays in the browser as an object URL. Do not upload it to the server unless the product requirements explicitly change.
 
-## 4. Important design decisions
+## RAG rules
 
-The primary pipeline intentionally overlaps Gemini and Azure: every Gemini text delta is sent to Azure TextStream immediately. Azure callbacks emit raw 24 kHz Int16 mono PCM and visemes as they are generated.
+- Production: Supabase/pgvector + Gemini embeddings.
+- Local fallback: ignored JSON store + keyword scoring.
+- Workspace IDs are browser-generated and currently unauthenticated.
+- RAG failure must not block a normal AI answer.
+- Sensitive documents should not be used until authentication/authorization is added.
 
-The protocol uses response_id so stale events can be discarded after cancellation. Audio and viseme messages are separate because provider callbacks have different batch sizes. Browser Avatar.tsx reconstructs one cumulative audio timeline.
+## Local development
 
-Chrome autoplay is handled by starting/resuming TalkingHead's existing AudioContext from the Send or microphone user gesture. The TalkingHead webpack loader removes eager automatic resume.
+From `frontend/`:
 
-The browser holds normal PCM until a 160 ms viseme look-ahead is available. This adds latency but prevents a late mouth cue from missing the syllable. If Azure provides no usable cues, synthetic aa/E/O/PP/I/sil cues are inserted per chunk.
+```powershell
+npm run dev
+```
 
-RAG is best effort. Retrieval is awaited before Gemini; retrieval errors are logged and the turn continues without context. Workspace IDs are client-generated and there is currently no authentication/authorization boundary.
+This starts:
 
-## 5. Problems encountered and resolutions
+- Next.js: `http://localhost:3000`
+- WebSocket/preview server: `http://localhost:3001`
 
-Embedded Git repository: resolved by promoting frontend history to the parent and verifying Git reports renames rather than a submodule.
+Provider values may be loaded from ignored local environment files. Never print, document, or commit their values.
 
-Git ownership safety: Codex and the Windows owner have different SIDs. Repository-scoped safe.directory is passed to Git commands; global safety settings were not changed.
+## Required checks
 
-Temporary metadata move permissions: an attempted metadata move toward C:\tmp partially failed. The nested .git was located and restored; the temporary empty metadata backup was removed only after exact path verification.
+```powershell
+cd frontend
+npm run lint
+npm exec tsc -- --noEmit
+npm run build
+```
 
-Lint/build verification: frontend lint passed with one existing unused _text warning at frontend/lib/server/avatarPipeline.ts:104 and no errors. Backend compileall passed with the project interpreter. Production build exceeded three minutes in the OneDrive-backed workspace without returning a compiler error; rerun outside OneDrive or with a longer timeout.
+```powershell
+backend\.venv\Scripts\python.exe -m compileall -q backend
+git diff --check
+```
 
-API key safety: root/frontend ignore rules exclude .env*, backend .env, .venv, node_modules, .next, .vercel, and logs. Do not expose values in diagnostics, documentation, issues, screenshots, or AI prompts.
+For avatar/lip-sync changes, also test:
 
-## 6. Rules for another AI
+- MPFB-compatible GLB,
+- Brunette-compatible GLB,
+- Avaturn-compatible GLB,
+- Nova,
+- Aria,
+- Atlas,
+- preview speech,
+- complete WebSocket speech,
+- browser console.
 
-1. Work on development; never make exploratory edits directly on safe.
-2. Read PROJECT_TECHNICAL_DOCUMENTATION.md before changing protocol, RAG, TTS, or avatar timing.
-3. Treat frontend/app/api/ws/route.ts plus frontend/lib/server/avatarPipeline.ts as primary unless FastAPI is explicitly requested.
-4. Inspect frontend/server.mjs separately because its null SpeechSession is a known audio risk.
-5. Preserve response_id and the response event schema; update server, ServerMessage types, and HomePage.handleMessage together for protocol changes.
-6. Normal stream audio is raw 24 kHz Int16 mono PCM, not WAV.
-7. Do not apply visemes immediately on arrival; maintain cumulative PCM timing and look-ahead.
-8. Keep turns serialized per connection unless cancellation/history semantics are redesigned.
-9. Add bounded retries without replaying already-yielded speech.
-10. Add tests before broad refactors; no automated test suite is tracked.
+## Git and deployment
 
-## 7. Safe development workflow
+- Use `development` for active upgrades.
+- Do not force-push.
+- Stage explicit files; private local text files and environment files must remain ignored.
+- Vercel production is linked from `frontend/.vercel/project.json`.
+- Production deploys are made from `frontend/`.
+- After deployment, inspect the deployment and verify the stable alias.
 
-Use this sequence from the repository root:
+## Known limitations
 
-    git switch development
-    git status -sb
-    npm.cmd run lint --prefix frontend
-    backend\.venv\Scripts\python.exe -m compileall -q backend
-    npm.cmd run build --prefix frontend
-    git diff --check
-    git add <intended-files>
-    git commit -m "Focused change description"
-    git push origin development
+- no persistent long-term conversation memory,
+- no authentication,
+- no workspace authorization,
+- avatar/system prompt not persistent,
+- batch STT,
+- complete-response Gemini generation,
+- no full automated test suite,
+- duplicate Node/FastAPI implementations,
+- WebGL limits for complex GLBs.
 
-After review, merge development into safe and redeploy safe. Do not force-push either branch.
+## Next recommended work
 
-## 8. Troubleshooting
-
-Text but no response_audio: check whether the live server is the Next route or server.mjs, Azure key/region, SpeechSession creation, and synthesis completion logs.
-
-response_audio exists but browser is silent: check Avatar.startStream returned true, AudioContext is running, sample_rate is 24000, the call came from a user gesture, and PCM has even byte length.
-
-Audio plays but mouth is still: inspect response_viseme frames, Azure-to-Oculus mapping, the OCULUS_VISEMES allowlist, monotonic offsets, and GLB morph targets.
-
-No transcript: the browser must send audio_metadata JSON followed by one binary frame. Recordings are batch, empty recordings are rejected, and the 25 MiB limit applies.
-
-RAG ignored: confirm local workspace ID, session_config, Supabase service-role variables, Gemini embedding key, vector extension, document_chunks table, HNSW index, and match_document_chunks RPC.
-
-WebSocket reconnect loop: verify NEXT_PUBLIC_WS_URL, ws/wss protocol, proxy upgrade support, and the /api/ws upgrade route. The client retries with a capped exponential backoff and can replay pending actions after reconnect.
-
-## 9. Next-level upgrade candidates
-
-Unify or retire one backend implementation. Fix server.mjs to create and close a real SpeechSession. Add authentication, workspace authorization, rate limits, provider timeouts, structured tracing, and CI. Add tests for chunking, viseme mapping, PCM resampling, envelope parsing, cancellation, and stream completion. Make document replacement transactional and parallelize embeddings with bounded concurrency. Consider partial STT to reduce post-speech delay. Separate text-complete from audio-drained UI events. Configure preview deployments from development and production deployments from safe.
-
-## 10. Security rules
-
-Keep GEMINI_API_KEY, GROQ_API_KEY, AZURE_SPEECH_KEY, RAG_SUPABASE_SERVICE_ROLE_KEY, database URLs, JWT secrets, and Vercel OIDC tokens server-side. Rotate any credential that appears in a public issue, chat, commit, screenshot, or build artifact. Treat the Supabase service-role key as database-administration access.
-
-## 11. Handoff checklist
-
-Before changing code, an AI should know which backend is active, know safe is the live baseline and development is the work branch, inspect only environment variable presence, understand batch STT versus streamed Gemini/TTS, know that response_end waits for Azure completion, preserve PCM/viseme timing, update both ends of WebSocket changes, run lint/compile/build, and keep safe deployable.
+1. Authentication and authorization.
+2. Automated tests and CI.
+3. Optional user-controlled persistent memory.
+4. True streamed Gemini-to-Azure synthesis.
+5. Partial/live STT.
+6. Persistent avatar library.
+7. RAG citations and document deletion.
+8. Structured tracing and provider dashboards.

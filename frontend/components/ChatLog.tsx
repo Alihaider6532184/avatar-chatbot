@@ -6,7 +6,7 @@ export interface ChatMessage {
 
 export function ChatLog({ messages }: { messages: ChatMessage[] }) {
   return (
-    <div className="flex min-h-40 max-h-64 flex-col gap-3 overflow-y-auto pr-1" aria-live="polite">
+    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pr-1" aria-live="polite">
       {messages.length === 0 ? (
         <p className="m-auto text-center text-sm text-slate-400">Ask your avatar anything.</p>
       ) : (

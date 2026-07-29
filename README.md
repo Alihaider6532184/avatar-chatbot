@@ -1,81 +1,202 @@
-# 3D Talking Avatar Chatbot
+# PITB 3D Talking Avatar Assistant
 
-A production-structured 3D talking avatar chatbot built for the PITB internship deliverable. The browser is intentionally a lightweight renderer: it records/sends user input to the FastAPI service, then renders the Ready Player Me avatar and plays the returned audio and viseme timeline. Speech recognition, Gemini reasoning, Azure speech synthesis, and viseme translation all stay in the backend. This centralizes AI logic, prevents provider keys from reaching the browser, and makes providers easier to iterate on or swap later.
+A production-deployed conversational 3D avatar that accepts typed or spoken questions, answers with Gemini, speaks through Microsoft Azure voices, and animates compatible GLB facial morph targets with timed visemes.
 
-## Architecture
+**Live application:** [avatar-chatbot-psi.vercel.app](https://avatar-chatbot-psi.vercel.app)
 
+**Full documentation:** [PROJECT_TECHNICAL_DOCUMENTATION.md](PROJECT_TECHNICAL_DOCUMENTATION.md)
+
+## Final product
+
+### Empty, user-controlled starting state
+
+The application intentionally starts without a default avatar. The user must upload a compatible GLB before voice and conversation controls become active.
+
+![Final interface with empty avatar area](docs/screenshots/01-final-interface.png)
+
+### Compatible GLB loaded
+
+Avatar files are validated in the browser and rendered from a temporary object URL. The GLB itself is not uploaded to the server.
+
+![Compatible GLB avatar loaded](docs/screenshots/02-avatar-loaded.png)
+
+### Spoken conversation with the avatar
+
+The right-side conversation panel remains aligned with the avatar while the selected model speaks the Azure-generated response.
+
+![Completed avatar conversation](docs/screenshots/03-conversation.png)
+
+### Expandable conversation workspace
+
+The horizontal handle below the conversation panel can be dragged downward to enlarge the chat and hide the system-instruction and document panels. It also supports the keyboard and remembers the selected height.
+
+![Expanded chat panel with setup controls hidden](docs/screenshots/04-expanded-chat.png)
+
+## Main capabilities
+
+- Upload a custom `.glb` avatar up to 50 MB.
+- Validate GLB 2.0 structure, humanoid skeleton nodes, skinning, facial morph targets, and required Oculus visemes before rendering.
+- Start with an empty avatar window rather than forcing a built-in model.
+- Choose and preview three Azure voices:
+  - **Nova** — `en-US-JennyNeural`
+  - **Aria** — `en-US-AriaNeural`
+  - **Atlas** — `en-US-GuyNeural`
+- Ask questions by text or microphone.
+- Transcribe microphone recordings with Groq Whisper.
+- Generate grounded conversational replies with Gemini.
+- Upload PDF, TXT, Markdown, CSV, JSON, or HTML documents for retrieval-augmented answers.
+- Store document chunks in Supabase/pgvector in production, with a local JSON fallback for development.
+- Synthesize 24 kHz speech with exact Azure viseme offsets.
+- Map Azure viseme IDs to Oculus mouth shapes and schedule them against the audio timeline.
+- Interrupt an active response when the user begins speaking.
+- Set a custom system instruction for the active session.
+- Resize the chat panel to prioritize conversation after setup is complete.
+- Run locally as a split Next.js and WebSocket development environment.
+- Deploy as a unified Next.js application on Vercel.
+
+## Current architecture
+
+```mermaid
+flowchart LR
+    U["User: text or microphone"] --> UI["Next.js / React interface"]
+    UI --> WS["WebSocket /api/ws"]
+    WS --> STT["Groq Whisper STT<br/>(audio turns only)"]
+    STT --> AI["Gemini response generation"]
+    WS --> AI
+    DOC["Uploaded documents"] --> RAG["Gemini embeddings +<br/>Supabase pgvector"]
+    RAG --> AI
+    AI --> TTS["Azure Speech SDK"]
+    TTS --> OUT["24 kHz PCM audio +<br/>timed viseme events"]
+    OUT --> AV["TalkingHead + Three.js avatar"]
 ```
-Mic audio or typed text → FastAPI WebSocket (/ws/chat)
-  audio only: Groq Whisper (whisper-large-v3-turbo) → text
-  text + in-memory session history → Gemini 2.5 Flash → reply
-  reply → Azure Speech (en-US-JennyNeural) → WAV audio + viseme events
-  WebSocket response: text + base64 audio + mapped timed Oculus visemes
-→ Next.js renderer → TalkingHead/RPM avatar lip-sync
+
+The primary production implementation lives inside `frontend/`. The separate `backend/` directory contains a FastAPI implementation retained for development history and alternative-backend work.
+
+## Local development
+
+### Prerequisites
+
+- Node.js 22 or newer
+- npm
+- Provider credentials for Gemini, Groq, and Azure Speech
+- Optional Supabase/Postgres configuration for production-style RAG
+- A compatible Oculus-viseme GLB for full lip-sync testing
+
+### Configure provider variables
+
+Copy the backend template and fill the local values:
+
+```powershell
+Copy-Item backend\.env.example backend\.env
 ```
 
-The frontend never calls Gemini, Groq, or Azure and contains no API keys. Its only backend connection is `NEXT_PUBLIC_WS_URL`.
+Required variables:
 
-## Setup
+```text
+GEMINI_API_KEY
+GROQ_API_KEY
+AZURE_SPEECH_KEY
+AZURE_SPEECH_REGION
+```
 
-### Backend
+Never commit `.env` files or provider values.
 
-1. Open a terminal in `backend`.
-2. Create and activate a virtual environment (recommended):
+### Start the application
 
-   ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
+```powershell
+cd frontend
+npm install
+npm run dev
+```
 
-3. Install dependencies and configure local secrets:
+Open [http://localhost:3000](http://localhost:3000).
 
-   ```powershell
-   pip install -r requirements.txt
-   Copy-Item .env.example .env
-   ```
+The development launcher starts:
 
-4. Fill `GEMINI_API_KEY`, `GROQ_API_KEY`, `AZURE_SPEECH_KEY`, and `AZURE_SPEECH_REGION` in `backend/.env`. Do not commit this file.
-5. Run the API:
+- Next.js on port `3000`
+- the local WebSocket/voice-preview server on port `3001`
 
-   ```powershell
-   uvicorn main:app --reload
-   ```
+It automatically makes the frontend use `ws://localhost:3001/api/ws`.
 
-The local health endpoint is available at `http://localhost:8000/health`.
+### Optional RAG configuration
 
-### Frontend
+When the following variables are configured, documents use Supabase and Gemini embeddings:
 
-1. Open a second terminal in `frontend`.
-2. Install dependencies and configure the internal backend URL:
+```text
+RAG_SUPABASE_URL
+RAG_SUPABASE_SERVICE_ROLE_KEY
+RAG_POSTGRES_URL_NON_POOLING
+```
 
-   ```powershell
-   npm install
-   Copy-Item .env.local.example .env.local
-   npm run dev
-   ```
+Without those variables, local development stores extracted chunks in:
 
-3. Open `http://localhost:3000` and allow microphone access when prompted.
+```text
+frontend/.local-data/document-chunks.json
+```
 
-`READY_PLAYER_ME_AVATAR_URL` at the top of `frontend/components/Avatar.tsx` is the configurable default avatar. For best lip-sync, use a Ready Player Me export that includes Oculus viseme morph targets.
+The local data directory is ignored by Git.
 
-### Avatar and voice personalization
+## Validation commands
 
-- Use **Upload GLB** below the avatar to load a custom model for the current browser session. Files are validated in the browser and are never uploaded to the server. Humanoid GLBs with Oculus or ARKit facial morph targets give the best lip-sync results.
-- Choose from Nova, Aria, or Atlas. **Preview** generates a short Azure Speech sample and animates the avatar with the returned visemes; selecting a card uses that voice for future replies. The selected voice is remembered in local storage.
-- With the documented split frontend/backend setup, `/api/voice-preview` proxies to `BACKEND_HTTP_URL` (or derives it from `NEXT_PUBLIC_WS_URL`). In an integrated deployment with Azure variables available to Next.js, it synthesizes the sample directly.
+```powershell
+cd frontend
+npm run lint
+npm exec tsc -- --noEmit
+npm run build
+```
 
-## Pipeline
+Python source validation:
 
-1. The client sends either a typed JSON message or a binary `MediaRecorder` audio blob through `/ws/chat`.
-2. FastAPI transcribes audio with Groq Whisper when needed and retains a short in-memory conversation history for that WebSocket session.
-3. Gemini produces a concise, conversational reply. The backend retries the LLM once if it fails.
-4. Azure Speech synthesizes a WAV reply and emits standard Azure viseme IDs with audio offsets. `backend/viseme_map.py` translates those IDs to the Oculus names TalkingHead expects.
-5. The backend sends text, base64 WAV audio, and timed visemes in one WebSocket response. The frontend adds the chat bubble and lets TalkingHead schedule the audio and mouth shapes. If TTS fails, text is still returned.
+```powershell
+backend\.venv\Scripts\python.exe -m compileall -q backend
+```
 
-Each backend provider stage logs its latency to the Uvicorn console for demos and performance discussion.
+## Repository structure
 
-## Notes
+```text
+avatar-chatbot/
+├── README.md
+├── PROJECT_TECHNICAL_DOCUMENTATION.md
+├── AI_HANDOFF_CONTEXT.md
+├── docs/
+│   └── screenshots/
+├── frontend/
+│   ├── app/
+│   ├── components/
+│   ├── lib/
+│   ├── scripts/
+│   ├── dev.mjs
+│   └── server.mjs
+└── backend/
+    ├── main.py
+    ├── services/
+    └── viseme_map.py
+```
 
-- Conversation history is intentionally in-memory and scoped to one WebSocket connection; no database is required for this version.
-- The WebSocket client reconnects with capped exponential backoff after an unexpected disconnect.
-- `.env` and `.env.local` are local-only files. Keep them out of source control.
+## Memory status
+
+The assistant has **short-term session memory only**. The server retains the most recent 12 user/assistant messages in memory for the current WebSocket connection. That history is lost when the connection, tab, or server session ends.
+
+There is **no persistent long-term conversational memory** in a database.
+
+Uploaded document knowledge is persistent storage/RAG, not conversational memory.
+
+## Deployment
+
+The production application is hosted on Vercel:
+
+[https://avatar-chatbot-psi.vercel.app](https://avatar-chatbot-psi.vercel.app)
+
+Production provider credentials are stored as encrypted Vercel environment variables and are not part of this repository.
+
+## Documentation maintenance
+
+Use [PROJECT_TECHNICAL_DOCUMENTATION.md](PROJECT_TECHNICAL_DOCUMENTATION.md) as the primary project record. Future changes should add:
+
+1. the date and objective,
+2. the design decision,
+3. files or services changed,
+4. problems encountered,
+5. verification performed,
+6. deployment and rollback notes,
+7. new limitations or follow-up work.
