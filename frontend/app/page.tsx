@@ -24,14 +24,20 @@ import {
   isVoiceId,
   type VoiceId,
 } from "@/lib/voices";
+import {
+  BUILT_IN_AVATARS,
+  CUSTOM_AVATAR_DEFAULTS,
+  type AvatarModelOptions,
+} from "@/lib/avatars";
 import { validateAvatarGlb } from "@/lib/avatarValidation";
 
 type AvatarState = "idle" | "listening" | "thinking" | "speaking";
 
 interface AvatarChoice {
   custom: boolean;
+  id: string | null;
+  model: AvatarModelOptions | null;
   name: string;
-  url: string | null;
 }
 
 interface VoicePreviewResponse {
@@ -90,13 +96,17 @@ export default function HomePage() {
   const [avatarState, setAvatarState] = useState<AvatarState>("idle");
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [avatarReady, setAvatarReady] = useState(false);
+  const [avatarLoading, setAvatarLoading] = useState(false);
   const [validatingAvatar, setValidatingAvatar] = useState(false);
   const [avatarChoice, setAvatarChoice] = useState<AvatarChoice>({
     custom: false,
+    id: null,
+    model: null,
     name: "No avatar selected",
-    url: null,
   });
-  const [avatarStatus, setAvatarStatus] = useState("Upload a compatible GLB avatar to begin.");
+  const [avatarStatus, setAvatarStatus] = useState(
+    "Choose one of our avatars or upload your own GLB to begin.",
+  );
   const [selectedVoice, setSelectedVoice] = useState<VoiceId>(DEFAULT_VOICE_ID);
   const [previewingVoice, setPreviewingVoice] = useState<VoiceId | null>(null);
   const [chatPanelHeight, setChatPanelHeight] = useState(CHAT_PANEL_DEFAULT_HEIGHT);
@@ -255,6 +265,28 @@ export default function HomePage() {
     }
   };
 
+  const selectBuiltInAvatar = (avatarId: string) => {
+    const avatar = BUILT_IN_AVATARS.find((item) => item.id === avatarId);
+    if (!avatar || (avatarChoice.id === avatar.id && avatarReady)) return;
+
+    previewRequestRef.current?.abort();
+    avatarRef.current?.cancelStream();
+    const previousUrl = customAvatarUrlRef.current;
+    customAvatarUrlRef.current = null;
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+    setAvatarReady(false);
+    setAvatarLoading(true);
+    setAvatarState("idle");
+    setPreviewingVoice(null);
+    setAvatarStatus(`Loading ${avatar.name}…`);
+    setAvatarChoice({
+      custom: false,
+      id: avatar.id,
+      model: avatar.model,
+      name: avatar.name,
+    });
+  };
+
   const uploadAvatar = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = "";
@@ -288,10 +320,16 @@ export default function HomePage() {
     customAvatarUrlRef.current = url;
     if (previousUrl) URL.revokeObjectURL(previousUrl);
     setAvatarReady(false);
+    setAvatarLoading(true);
     setAvatarState("idle");
     setPreviewingVoice(null);
     setAvatarStatus("Loading your 3D avatar…");
-    setAvatarChoice({ custom: true, name: file.name, url });
+    setAvatarChoice({
+      custom: true,
+      id: "custom",
+      model: { url, ...CUSTOM_AVATAR_DEFAULTS },
+      name: file.name,
+    });
   };
 
   const resetAvatar = () => {
@@ -301,13 +339,15 @@ export default function HomePage() {
     customAvatarUrlRef.current = null;
     if (previousUrl) URL.revokeObjectURL(previousUrl);
     setAvatarReady(false);
+    setAvatarLoading(false);
     setAvatarState("idle");
     setPreviewingVoice(null);
-    setAvatarStatus("Upload a compatible GLB avatar to begin.");
+    setAvatarStatus("Choose one of our avatars or upload your own GLB to begin.");
     setAvatarChoice({
       custom: false,
+      id: null,
+      model: null,
       name: "No avatar selected",
-      url: null,
     });
   };
 
@@ -455,6 +495,7 @@ export default function HomePage() {
   };
 
   const busy = avatarState === "thinking" || avatarState === "speaking";
+  const avatarSelected = avatarChoice.model !== null;
   const setupPanelHeight = CHAT_PANEL_MAX_HEIGHT - chatPanelHeight;
   const showSetupPanels = setupPanelHeight >= 72;
 
@@ -464,15 +505,17 @@ export default function HomePage() {
         <div>
           <div className="relative">
             <Avatar
-              avatarUrl={avatarChoice.url}
+              avatar={avatarChoice.model}
               onError={(message) => {
                 setAvatarReady(false);
-                setAvatarStatus("Avatar loading failed.");
+                setAvatarLoading(false);
+                setAvatarStatus("Avatar loading failed. Please choose another avatar or upload your own.");
                 addMessage("system", message);
               }}
               onReady={() => {
                 setAvatarReady(true);
-                setAvatarStatus("Your avatar is loaded and ready");
+                setAvatarLoading(false);
+                setAvatarStatus(`${avatarChoice.name} is loaded and ready.`);
               }}
               onSpeechStart={() => setAvatarState("speaking")}
               onSpeechEnd={() => {
@@ -481,9 +524,25 @@ export default function HomePage() {
               }}
               ref={avatarRef}
             />
+            {!avatarSelected ? (
+              <div className="pointer-events-none absolute inset-0 grid place-items-center px-8 text-center">
+                <div className="max-w-xs rounded-3xl border border-cyan-300/20 bg-slate-950/75 px-6 py-5 shadow-2xl backdrop-blur-md">
+                  <span className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-cyan-400/10 text-cyan-200">
+                    <svg aria-hidden="true" fill="none" height="28" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24" width="28">
+                      <circle cx="12" cy="8" r="3.25" />
+                      <path d="M5.5 20a6.5 6.5 0 0 1 13 0M19 5v4m-2-2h4" />
+                    </svg>
+                  </span>
+                  <p className="mt-3 text-sm font-bold text-white">Choose your avatar to begin</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-400">
+                    Select one of the three ready-made avatars below or upload your own GLB.
+                  </p>
+                </div>
+              </div>
+            ) : null}
             <div className="absolute left-5 top-5 flex items-center gap-2 rounded-full bg-slate-950/75 px-3 py-1.5 text-xs font-medium backdrop-blur">
-              <span className={`h-2 w-2 rounded-full ${avatarState === "listening" ? "bg-rose-400" : avatarState === "speaking" ? "bg-cyan-300" : "bg-emerald-400"}`} />
-              {stateCopy[avatarState]}
+              <span className={`h-2 w-2 rounded-full ${!avatarSelected ? "bg-amber-300" : avatarState === "listening" ? "bg-rose-400" : avatarState === "speaking" ? "bg-cyan-300" : "bg-emerald-400"}`} />
+              {avatarSelected ? stateCopy[avatarState] : "Avatar needed"}
             </div>
           </div>
           <AvatarCustomizer
@@ -493,16 +552,19 @@ export default function HomePage() {
               busy
               || previewingVoice !== null
               || validatingAvatar
-              || (avatarChoice.url !== null && !avatarReady)
+              || avatarLoading
             }
             customAvatar={avatarChoice.custom}
+            hasAvatar={avatarSelected}
             onAvatarUpload={uploadAvatar}
             onPreviewVoice={(voiceId) => { void previewVoice(voiceId); }}
             onResetAvatar={resetAvatar}
+            onSelectAvatar={selectBuiltInAvatar}
             onSelectVoice={selectVoice}
             previewingVoice={previewingVoice}
+            selectedAvatarId={avatarChoice.id}
             selectedVoice={selectedVoice}
-            voiceDisabled={!avatarReady || busy || previewingVoice !== null || validatingAvatar}
+            voiceDisabled={!avatarReady || busy || previewingVoice !== null || validatingAvatar || avatarLoading}
           />
         </div>
 
@@ -592,7 +654,7 @@ export default function HomePage() {
               className="min-w-0 flex-1 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm outline-none placeholder:text-slate-500 focus:border-cyan-400"
               disabled={busy || !avatarReady}
               onChange={(event) => setDraft(event.target.value)}
-              placeholder={avatarReady ? "Type a message…" : "Upload an avatar first…"}
+              placeholder={avatarReady ? "Type a message…" : "Choose or upload an avatar first…"}
               value={draft}
             />
             <MicButton

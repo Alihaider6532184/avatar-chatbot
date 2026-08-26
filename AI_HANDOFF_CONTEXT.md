@@ -56,7 +56,14 @@ The current validator requires:
 - facial morph targets,
 - complete required Oculus viseme target names.
 
-The avatar file stays in the browser as an object URL. Do not upload it to the server unless the product requirements explicitly change.
+Custom avatar files stay in the browser as object URLs. Do not upload them to the server unless the product requirements explicitly change.
+
+The current startup flow is user-controlled but offers two paths:
+
+- select Mira, Lina, or Zayn from `frontend/lib/avatars.ts`, or
+- upload a custom GLB that passes the validator.
+
+Built-in models use commit-pinned external sample URLs and per-model retarget/baseline settings. Preserve those settings when replacing a URL, and confirm asset licensing before commercial deployment.
 
 ## RAG rules
 

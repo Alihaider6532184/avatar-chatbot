@@ -1412,6 +1412,7 @@ avatar-chatbot/
 │   │   ├── ChatLog.tsx
 │   │   └── MicButton.tsx
 │   ├── lib/
+│   │   ├── avatars.ts
 │   │   ├── avatarValidation.ts
 │   │   ├── voices.ts
 │   │   ├── wsClient.ts
@@ -1443,6 +1444,7 @@ avatar-chatbot/
 - Provider pipeline: `frontend/lib/server/avatarPipeline.ts`
 - Documents/RAG: `frontend/lib/server/rag.ts`
 - GLB validation: `frontend/lib/avatarValidation.ts`
+- Built-in avatar catalog: `frontend/lib/avatars.ts`
 - Voice mapping: `frontend/lib/voices.ts`
 - Local launcher: `frontend/dev.mjs`
 
@@ -1495,3 +1497,54 @@ What approach was selected and why?
 ```
 
 When protocol, memory, RAG, avatar validation, speech timing, or deployment architecture changes, update both this document and `AI_HANDOFF_CONTEXT.md`.
+
+---
+
+## 22. Upgrade history
+
+### 2026-08-26 — Guided built-in or custom avatar selection
+
+**Objective**
+
+Let a first-time user start quickly with one of three provided avatars while preserving the option to upload a custom compatible GLB.
+
+**Design**
+
+The empty avatar viewport now asks the user to choose an avatar. The personalization panel presents three ready-made cards first, then an equally visible custom-upload alternative. No avatar is forced automatically, so the final choice remains user-controlled.
+
+**Implementation**
+
+- Added `frontend/lib/avatars.ts` as the built-in catalog and model-configuration source.
+- Added pinned CDN models for Mira, Lina, and Zayn with per-model body, retarget, and baseline settings.
+- Updated `frontend/components/Avatar.tsx` to accept complete model settings instead of only a URL.
+- Rebuilt `frontend/components/AvatarCustomizer.tsx` as a guided choose-or-upload flow with accessible pressed states and live loading status.
+- Updated `frontend/app/page.tsx` to switch between built-in and object-URL models, safely revoke replaced custom URLs, and keep retry controls available after a loading error.
+- No API, WebSocket protocol, database, or environment-variable changes were required.
+
+**Problems encountered**
+
+- The three GLB files were not stored in the workspace. The ready-made choices therefore use immutable, commit-pinned sample URLs from the TalkingHead demonstration repository.
+- The embedded browser verification runtime could not initialize in the current Windows session. Verification continued at the build, HTTP, server, and GLB-structure layers; interactive visual QA remains a follow-up.
+- A local untracked plaintext credential file was found, permanently removed, and added to `.gitignore`. The exposed credentials were rotated before deployment.
+
+**Verification**
+
+- Targeted ESLint: passed.
+- TypeScript `--noEmit`: passed.
+- Next.js production build: passed.
+- Local page: HTTP 200 and contains the selection guide, all three choices, and custom-upload control.
+- Local avatar server health: passed.
+- All three remote GLBs: HTTP 200, valid humanoid skeleton, complete required Oculus viseme set.
+
+**Deployment**
+
+- Deployed to Vercel production on 2026-08-26 using a blue/green flow: isolated production build, smoke checks, then promotion.
+- Production deployment `dpl_ELgfFUpXfrmpW5XZjyLPQ8M8RieR` reached `READY` and is served at [https://avatar-chatbot-psi.vercel.app](https://avatar-chatbot-psi.vercel.app).
+- The public page returned HTTP 200 with all three built-in avatar choices and the custom-upload control, the WebSocket upgrade succeeded, and the Supabase document route returned HTTP 200.
+- Azure Speech authentication required the previously disabled Azure subscription to be reactivated separately; this was an external service-state issue rather than a build failure.
+
+**New limitations or next steps**
+
+- Complete interactive browser QA across desktop and mobile browsers.
+- Confirm the three sample asset licenses fit the deployment's commercial/non-commercial status, or replace the catalog URLs with organization-owned GLBs.
+- Add real preview renders for the three avatar cards when approved thumbnails are available.

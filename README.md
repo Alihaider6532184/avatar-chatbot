@@ -8,9 +8,9 @@ A production-deployed conversational 3D avatar that accepts typed or spoken ques
 
 ## Final product
 
-### Empty, user-controlled starting state
+### Guided, user-controlled starting state
 
-The application intentionally starts without a default avatar. The user must upload a compatible GLB before voice and conversation controls become active.
+The application starts with a clear choice: select one of three ready-made avatars or upload a compatible GLB. Voice and conversation controls become active after the selected model loads.
 
 ![Final interface with empty avatar area](docs/screenshots/01-final-interface.png)
 
@@ -35,8 +35,9 @@ The horizontal handle below the conversation panel can be dragged downward to en
 ## Main capabilities
 
 - Upload a custom `.glb` avatar up to 50 MB.
+- Select one of three ready-made avatars for a quick start.
 - Validate GLB 2.0 structure, humanoid skeleton nodes, skinning, facial morph targets, and required Oculus visemes before rendering.
-- Start with an empty avatar window rather than forcing a built-in model.
+- Guide first-time users to choose a ready-made avatar or upload their own model.
 - Choose and preview three Azure voices:
   - **Nova** — `en-US-JennyNeural`
   - **Aria** — `en-US-AriaNeural`
@@ -53,6 +54,8 @@ The horizontal handle below the conversation panel can be dragged downward to en
 - Resize the chat panel to prioritize conversation after setup is complete.
 - Run locally as a split Next.js and WebSocket development environment.
 - Deploy as a unified Next.js application on Vercel.
+
+The ready-made models are pinned sample assets from the [TalkingHead demonstration repository](https://github.com/met4citizen/TalkingHead). Their original licenses apply; the included samples are intended for non-commercial demonstration unless the respective asset provider grants commercial use.
 
 ## Current architecture
 

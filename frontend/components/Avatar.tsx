@@ -3,6 +3,7 @@
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { Box3, MathUtils, Vector3, type Camera, type Group, type PerspectiveCamera } from "three";
+import type { AvatarModelOptions } from "@/lib/avatars";
 import type { ChatResponse, TimedViseme } from "@/lib/wsClient";
 
 interface TalkingHeadLike {
@@ -12,7 +13,7 @@ interface TalkingHeadLike {
     preProcessText: (text: string) => string;
     wordsToVisemes: (word: string) => { visemes: string[]; times: number[]; durations: number[] };
   }>;
-  showAvatar: (options: { url: string; body: "F" | "M"; avatarMood: string }) => Promise<void>;
+  showAvatar: (options: AvatarModelOptions) => Promise<void>;
   animate: (milliseconds: number) => void;
   speakAudio: (audio: {
     audio: AudioBuffer;
@@ -62,7 +63,7 @@ export interface AvatarHandle {
 }
 
 interface AvatarProps {
-  avatarUrl?: string | null;
+  avatar?: AvatarModelOptions | null;
   onReady: (usingFallback: boolean) => void;
   onSpeechStart: () => void;
   onSpeechEnd: () => void;
@@ -288,12 +289,12 @@ function frameUpperBody(camera: Camera, armature: Group) {
 }
 
 function AvatarScene({
-  avatarUrl,
+  avatar,
   onLoadStart,
   onHeadReady,
   onError,
 }: {
-  avatarUrl: string;
+  avatar: AvatarModelOptions;
   onLoadStart: () => void;
   onHeadReady: (head: TalkingHeadLike, usingFallback: boolean) => void;
   onError: (message: string) => void;
@@ -323,7 +324,7 @@ function AvatarScene({
         });
         const { LipsyncEn } = await import("@met4citizen/talkinghead/modules/lipsync-en.mjs");
         head.lipsync.en = new LipsyncEn();
-        await head.showAvatar({ url: avatarUrl, body: "F", avatarMood: "neutral" });
+        await head.showAvatar(avatar);
         if (cancelled) return;
         scene.add(head.armature);
         frameUpperBody(camera, head.armature);
@@ -340,14 +341,14 @@ function AvatarScene({
       if (head?.armature) scene.remove(head.armature);
       head?.dispose();
     };
-  }, [avatarUrl, camera, scene]);
+  }, [avatar, camera, scene]);
 
   useFrame((_, delta) => headRef.current?.animate(delta * 1_000));
   return <ambientLight intensity={1.5} />;
 }
 
 export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({
-  avatarUrl = null,
+  avatar = null,
   onReady,
   onSpeechStart,
   onSpeechEnd,
@@ -588,9 +589,9 @@ export const Avatar = forwardRef<AvatarHandle, AvatarProps>(function Avatar({
       <Canvas camera={{ position: [0, 1.5, 2.5], fov: 28 }} dpr={[1, 2]}>
         <color attach="background" args={["#0b1728"]} />
         <directionalLight intensity={2.5} position={[2, 4, 3]} />
-        {avatarUrl ? (
+        {avatar ? (
           <AvatarScene
-            avatarUrl={avatarUrl}
+            avatar={avatar}
             onError={onError}
             onLoadStart={() => {
               streamSessionRef.current += 1;
