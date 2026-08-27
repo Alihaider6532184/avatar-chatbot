@@ -12,6 +12,11 @@ import {
   type ChatHistory,
   type SpeechSession,
 } from "@/lib/server/avatarPipeline";
+import {
+  DEFAULT_VOICE_ID,
+  isVoiceId,
+  type VoiceId,
+} from "@/lib/voices";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -34,6 +39,7 @@ interface SessionConfigEnvelope {
   type: "session_config";
   system_prompt: string;
   workspace_id: string;
+  voice_id: VoiceId;
 }
 
 function parseEnvelope(data: WebSocketData): TextEnvelope | AudioMetadataEnvelope | CancelEnvelope | SessionConfigEnvelope {
@@ -53,10 +59,16 @@ function parseEnvelope(data: WebSocketData): TextEnvelope | AudioMetadataEnvelop
     payload.type === "session_config"
     && typeof payload.system_prompt === "string"
     && typeof payload.workspace_id === "string"
+    && isVoiceId(payload.voice_id)
   ) {
     if (payload.system_prompt.length > 4_000) throw new Error("System prompt must be under 4,000 characters.");
     if (!/^[a-zA-Z0-9-]{16,80}$/.test(payload.workspace_id)) throw new Error("Invalid workspace.");
-    return { type: "session_config", system_prompt: payload.system_prompt, workspace_id: payload.workspace_id };
+    return {
+      type: "session_config",
+      system_prompt: payload.system_prompt,
+      workspace_id: payload.workspace_id,
+      voice_id: payload.voice_id,
+    };
   }
   throw new Error("Unsupported message format.");
 }
@@ -70,9 +82,10 @@ export function GET(): Promise<Response> {
     let activeAbortController: AbortController | null = null;
     let systemPrompt = "";
     let workspaceId = "";
+    let voiceId: VoiceId = DEFAULT_VOICE_ID;
 
     try {
-      speechSession = createSpeechSession();
+      speechSession = createSpeechSession(voiceId);
     } catch (error) {
       sendPipelineError(ws, error);
     }
@@ -88,6 +101,11 @@ export function GET(): Promise<Response> {
           if (envelope.type === "session_config") {
             systemPrompt = envelope.system_prompt;
             workspaceId = envelope.workspace_id;
+            if (voiceId !== envelope.voice_id) {
+              closeSpeechSession(speechSession);
+              voiceId = envelope.voice_id;
+              speechSession = createSpeechSession(voiceId);
+            }
             return;
           }
           if (envelope.type === "audio_metadata") {
@@ -116,6 +134,7 @@ export function GET(): Promise<Response> {
             abortSignal: abortController.signal,
             systemPrompt: turnSystemPrompt,
             workspaceId,
+            voiceId,
           });
           return;
         }
@@ -126,6 +145,7 @@ export function GET(): Promise<Response> {
           abortSignal: abortController.signal,
           systemPrompt: turnSystemPrompt,
           workspaceId,
+          voiceId,
         });
       }).catch((error) => sendPipelineError(ws, error)).finally(() => {
         activeAbortController = null;

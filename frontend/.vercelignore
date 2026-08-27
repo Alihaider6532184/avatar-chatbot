@@ -1,0 +1,7 @@
+.env*
+.local-data/
+.next/
+node_modules/
+*.log
+passwords.txt
+academy latest project.txt
